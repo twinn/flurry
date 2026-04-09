@@ -184,15 +184,49 @@ Given `@decorate batch(get(id))`, Flurry:
 Missing records become `nil` in `:one` mode or `[]` in `:list`
 mode.
 
+## Multi-arg / group-keyed batching
+
+If your decorated function takes more than one argument, the **first**
+argument is the batched variable and the **remaining** arguments form
+a *group key*. Callers sharing the same group key coalesce into the
+same bulk call; callers with different group keys run as independent
+batches.
+
+```elixir
+@decorate batch(get_post(slug, user_id, active?))
+def get_many_posts(slugs, user_id, active?) do
+  Repo.all(
+    from p in Post,
+      where: p.slug in ^slugs and p.user_id == ^user_id and p.active == ^active?
+  )
+end
+
+# These three calls produce THREE separate bulk invocations, one per
+# distinct (user_id, active?) tuple:
+GroupedBatcher.get_post("a", 1, true)   # group {1, true}
+GroupedBatcher.get_post("b", 1, true)   # group {1, true}  (coalesces with "a")
+GroupedBatcher.get_post("c", 2, true)   # group {2, true}  (own batch)
+GroupedBatcher.get_post("d", 1, false)  # group {1, false} (own batch)
+```
+
+Each group has its own pending list, its own `batch_size` cap, its
+own priority queue for bisect retries, and its own slot in the
+producer's LRU flush rotation (so no group can starve the others).
+
+The decorator's first argument name is still the correlation field
+(`slug` in the example above — each returned record must have a
+`:slug` field matching the caller's request).
+
 ## Limitations
 
-- **Single-arg decorated functions only.** `batch(get(id))` works;
-  `batch(get(user_id, tenant_id))` does not. Composite keys would
-  require a non-trivial extension.
 - **No arbitrary correlation functions.** The record field used for
-  correlation is always the same atom as the argument name. If your
-  record has a differently-named field, wrap your bulk function to
-  rename the field before returning.
+  correlation is always the same atom as the first argument's name.
+  If your record has a differently-named field, wrap your bulk
+  function to rename the field before returning.
+- **Group keys must be structurally comparable.** Tuples of atoms,
+  numbers, and binaries work. Maps and structs are compared
+  structurally by Elixir, which works but may surprise you with
+  order-insensitive equality.
 - **Single-node.** Flurry's GenStage pipeline runs in-process on one
   node; there is no cluster-aware coalescing.
 - **Per-call timeout is a module-level default.** `GenServer.call`

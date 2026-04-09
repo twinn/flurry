@@ -31,11 +31,14 @@ defmodule Flurry.Consumer do
     {:noreply, [], state}
   end
 
-  defp process_batch({:flurry_batch, module, batch, entries}, state) do
+  defp process_batch({:flurry_batch, module, batch, group_key, entries}, state) do
     args = entries |> Enum.map(fn {arg, _from} -> arg end) |> Enum.uniq()
+    # The group key is the tuple of non-batched args captured at the call
+    # site; splat it into the bulk fn after the batched list.
+    bulk_args = [args | Tuple.to_list(group_key)]
 
     try do
-      results = apply(module, batch.bulk, [args])
+      results = apply(module, batch.bulk, bulk_args)
       correlated = correlate(results, batch.key, batch.returns)
 
       Enum.each(entries, fn {arg, from} ->
@@ -44,13 +47,14 @@ defmodule Flurry.Consumer do
     rescue
       # Rescued exceptions pass through raw so users can pattern-match on
       # their own domain exception types (Postgrex.Error, Ecto.*, etc).
-      e -> dispatch_failure(batch.on_failure, entries, state, e)
+      e -> dispatch_failure(batch.on_failure, group_key, entries, state, e)
     catch
       # Exits have no natural exception shape — wrap in BulkCallFailed so
       # callers always see a struct.
       :exit, reason ->
         dispatch_failure(
           batch.on_failure,
+          group_key,
           entries,
           state,
           Flurry.BulkCallFailed.exception(kind: :exit, reason: reason)
@@ -58,7 +62,7 @@ defmodule Flurry.Consumer do
     end
   end
 
-  defp dispatch_failure(strategy, entries, state, e) do
+  defp dispatch_failure(strategy, group_key, entries, state, e) do
     {replies, requeues} = handle_failure(strategy, entries, e)
 
     Enum.each(replies, fn {from, result} ->
@@ -66,7 +70,7 @@ defmodule Flurry.Consumer do
     end)
 
     if requeues != [] do
-      GenStage.cast(state.producer, {:requeue_batches, requeues})
+      GenStage.cast(state.producer, {:requeue_batches, group_key, requeues})
     end
   end
 

@@ -113,30 +113,45 @@ defmodule Flurry do
     singular_defs =
       Enum.map(batches, fn batch ->
         singular = batch.singular
-        arg_var = Macro.var(batch.key, nil)
+        batched_var = Macro.var(batch.key, nil)
+        group_vars = Enum.map(batch.group_args, &Macro.var(&1, nil))
+        all_vars = [batched_var | group_vars]
 
         # Return-mode-aware spec for the generated singular entry point.
         # We don't know the user's concrete types, so the best we can do
         # is communicate the shape: scalar-or-nil-or-error for :one mode,
-        # list-or-error for :list mode.
-        spec_ast =
-          case batch.returns do
-            :one ->
-              quote do
-                @spec unquote(singular)(term()) :: term() | nil | {:error, Exception.t()}
-              end
+        # list-or-error for :list mode. Every arg is typed as `term()`.
+        spec_arg_types = List.duplicate(quote(do: term()), length(all_vars))
 
-            :list ->
-              quote do
-                @spec unquote(singular)(term()) :: [term()] | {:error, Exception.t()}
-              end
+        return_type =
+          case batch.returns do
+            :one -> quote(do: term() | nil | {:error, Exception.t()})
+            :list -> quote(do: [term()] | {:error, Exception.t()})
+          end
+
+        spec_ast =
+          quote do
+            @spec unquote(singular)(unquote_splicing(spec_arg_types)) :: unquote(return_type)
+          end
+
+        # The group key tuple AST: `{user_id, active?}` for group_vars
+        # `[user_id, active?]`; `{}` for single-arg decorations.
+        group_tuple_ast =
+          case group_vars do
+            [] -> quote(do: {})
+            _ -> {:{}, [], group_vars}
           end
 
         quote do
           unquote(spec_ast)
 
-          def unquote(singular)(unquote(arg_var)) do
-            Flurry.Runtime.call(__MODULE__, unquote(singular), unquote(arg_var))
+          def unquote(singular)(unquote_splicing(all_vars)) do
+            Flurry.Runtime.call(
+              __MODULE__,
+              unquote(singular),
+              unquote(batched_var),
+              unquote(group_tuple_ast)
+            )
           end
         end
       end)

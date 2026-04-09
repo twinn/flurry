@@ -30,8 +30,10 @@ defmodule Flurry.Decorators do
     body
   end
 
-  defp register({singular, _meta, [{key, _key_meta, ctx}]}, opts, context)
-       when is_atom(singular) and is_atom(key) and is_atom(ctx) do
+  defp register({singular, _meta, [first_arg | rest_args]}, opts, context) when is_atom(singular) do
+    key = arg_name!(first_arg, singular)
+    group_args = Enum.map(rest_args, &arg_name!(&1, singular))
+
     returns = Keyword.get(opts, :returns, :one)
     batch_size = Keyword.get(opts, :batch_size)
     on_failure = Keyword.get(opts, :on_failure, :bisect)
@@ -54,6 +56,7 @@ defmodule Flurry.Decorators do
     Module.put_attribute(context.module, :flurry_batches, %{
       singular: singular,
       key: key,
+      group_args: group_args,
       bulk: context.name,
       arity: context.arity,
       returns: returns,
@@ -66,10 +69,20 @@ defmodule Flurry.Decorators do
     raise ArgumentError, """
     Flurry: malformed @decorate batch(...) call signature.
 
-    Expected: `batch(singular_name(arg_name))` or
-              `batch(singular_name(arg_name), returns: :one | :list)`
+    Expected: `batch(singular_name(arg_name))` for single-arg batching, or
+              `batch(singular_name(arg_name, group_arg_1, group_arg_2))` for
+              group-keyed batching. The first argument is the batched
+              variable; remaining arguments form the group key.
 
     Got: #{Macro.to_string(other)}
     """
+  end
+
+  defp arg_name!({name, _meta, ctx}, _singular) when is_atom(name) and is_atom(ctx), do: name
+
+  defp arg_name!(other, singular) do
+    raise ArgumentError,
+          "Flurry: malformed argument in @decorate batch(#{singular}(...)) — " <>
+            "expected a bare name, got: #{Macro.to_string(other)}"
   end
 end

@@ -7,74 +7,89 @@ defmodule Flurry.ProducerTest do
 
   alias Flurry.Producer
 
-  defp state(pending, demand, opts \\ []) do
+  # Default group key for tests that only care about single-group behavior.
+  @g {}
+
+  defp state(pending_map, demand, opts \\ []) do
+    group_order = Keyword.get(opts, :group_order, Map.keys(pending_map))
+
     %{
       module: FakeMod,
       batch: %{singular: :get, key: :id, bulk: :get_many, returns: :one, arity: 1},
       batch_size: Keyword.get(opts, :batch_size, 100),
-      pending: pending,
+      pending: pending_map,
+      group_order: group_order,
       demand: demand,
       priority: Keyword.get(opts, :priority, [])
     }
+  end
+
+  defp single_group(entries, demand, opts \\ []) do
+    state(%{@g => entries}, demand, opts)
   end
 
   defp entry(id), do: {id, {self(), make_ref()}}
 
   describe "maybe_emit/2 — empty cases" do
     test "no pending → no events" do
-      assert {[], s} = Producer.maybe_emit(state([], 1), 0)
-      assert s.pending == []
+      assert {[], s} = Producer.maybe_emit(state(%{}, 1), 0)
+      assert s.pending == %{}
+      assert s.group_order == []
     end
 
     test "no demand → no events even when pending + mailbox empty" do
-      assert {[], s} = Producer.maybe_emit(state([entry(1)], 0), 0)
-      assert length(s.pending) == 1
+      assert {[], s} = Producer.maybe_emit(single_group([entry(1)], 0), 0)
+      assert length(s.pending[@g]) == 1
     end
   end
 
   describe "maybe_emit/2 — mailbox-empty branch" do
     test "pending + demand + empty mailbox → flush everything as one batch" do
       pending = Enum.map([1, 2, 3], &entry/1)
-      assert {[event], s} = Producer.maybe_emit(state(pending, 1), 0)
-      assert {:flurry_batch, FakeMod, _batch, entries} = event
+      assert {[event], s} = Producer.maybe_emit(single_group(pending, 1), 0)
+      assert {:flurry_batch, FakeMod, _batch, @g, entries} = event
       assert length(entries) == 3
-      assert s.pending == []
+      # Empty group dropped from pending map.
+      assert s.pending == %{}
+      assert s.group_order == []
       assert s.demand == 0
     end
 
     test "single pending with empty mailbox → flush as singleton" do
-      assert {[event], _s} = Producer.maybe_emit(state([entry(42)], 1), 0)
-      assert {:flurry_batch, _, _, [{42, _}]} = event
+      assert {[event], _s} = Producer.maybe_emit(single_group([entry(42)], 1), 0)
+      assert {:flurry_batch, _, _, @g, [{42, _}]} = event
     end
   end
 
   describe "maybe_emit/2 — non-empty mailbox" do
     test "pending < batch_size with non-empty mailbox → hold" do
       pending = Enum.map([1, 2], &entry/1)
-      assert {[], s} = Producer.maybe_emit(state(pending, 1, batch_size: 100), 5)
-      assert length(s.pending) == 2
+      assert {[], s} = Producer.maybe_emit(single_group(pending, 1, batch_size: 100), 5)
+      assert length(s.pending[@g]) == 2
     end
 
     test "pending >= batch_size with non-empty mailbox → flush anyway" do
       pending = Enum.map(1..10, &entry/1)
-      assert {[event], s} = Producer.maybe_emit(state(pending, 1, batch_size: 10), 5)
-      assert {:flurry_batch, _, _, entries} = event
+      assert {[event], s} = Producer.maybe_emit(single_group(pending, 1, batch_size: 10), 5)
+      assert {:flurry_batch, _, _, @g, entries} = event
       assert length(entries) == 10
-      assert s.pending == []
+      assert s.pending == %{}
     end
 
     test "pending > batch_size with non-empty mailbox → flush batch_size, keep rest" do
       pending = Enum.map(1..15, &entry/1)
-      assert {[event], s} = Producer.maybe_emit(state(pending, 1, batch_size: 10), 5)
-      assert {:flurry_batch, _, _, entries} = event
+      assert {[event], s} = Producer.maybe_emit(single_group(pending, 1, batch_size: 10), 5)
+      assert {:flurry_batch, _, _, @g, entries} = event
       assert length(entries) == 10
-      assert length(s.pending) == 5
+      assert length(s.pending[@g]) == 5
+      # Group still tracked because not empty.
+      assert s.group_order == [@g]
     end
   end
 
   describe "maybe_emit/2 — demand accounting" do
     test "flushing one batch decrements demand by 1" do
-      assert {[_], s} = Producer.maybe_emit(state([entry(1)], 3), 0)
+      assert {[_], s} = Producer.maybe_emit(single_group([entry(1)], 3), 0)
       assert s.demand == 2
     end
   end
@@ -82,28 +97,27 @@ defmodule Flurry.ProducerTest do
   describe "priority queue" do
     # A priority queue holds pre-formed batches that were bisected by the
     # consumer and need to be re-tried AS-IS — not merged with each other
-    # and not merged with incoming pending requests. Emission drains
-    # priority in FIFO order, one batch per event, before it even looks at
-    # pending.
-
+    # and not merged with incoming pending requests. Priority items are
+    # tagged with their group key so that requeues route back to the
+    # correct group.
     test "with priority non-empty and demand > 0, flushes first priority batch as one event" do
       priority_batch = Enum.map([1, 2, 3], &entry/1)
       new_pending = [entry(99)]
 
       assert {[event], s} =
                Producer.maybe_emit(
-                 state(new_pending, 1, priority: [priority_batch]),
+                 single_group(new_pending, 1, priority: [{@g, priority_batch}]),
                  0
                )
 
-      assert {:flurry_batch, _, _, entries} = event
+      assert {:flurry_batch, _, _, @g, entries} = event
       # The event contains exactly the priority batch, not the pending.
       assert length(entries) == 3
       assert Enum.map(entries, fn {arg, _} -> arg end) == [1, 2, 3]
 
       # Priority drained, pending untouched.
       assert s.priority == []
-      assert length(s.pending) == 1
+      assert length(s.pending[@g]) == 1
       assert s.demand == 0
     end
 
@@ -112,85 +126,168 @@ defmodule Flurry.ProducerTest do
       b2 = Enum.map([3, 4], &entry/1)
       b3 = Enum.map([5, 6], &entry/1)
 
-      s0 = state([], 1, priority: [b1, b2, b3])
+      s0 = state(%{}, 1, priority: [{@g, b1}, {@g, b2}, {@g, b3}])
 
-      assert {[{:flurry_batch, _, _, e1}], s1} = Producer.maybe_emit(s0, 0)
+      assert {[{:flurry_batch, _, _, @g, e1}], s1} = Producer.maybe_emit(s0, 0)
       assert Enum.map(e1, fn {a, _} -> a end) == [1, 2]
       assert length(s1.priority) == 2
 
       s1 = %{s1 | demand: 1}
-      assert {[{:flurry_batch, _, _, e2}], s2} = Producer.maybe_emit(s1, 0)
+      assert {[{:flurry_batch, _, _, @g, e2}], s2} = Producer.maybe_emit(s1, 0)
       assert Enum.map(e2, fn {a, _} -> a end) == [3, 4]
       assert length(s2.priority) == 1
 
       s2 = %{s2 | demand: 1}
-      assert {[{:flurry_batch, _, _, e3}], s3} = Producer.maybe_emit(s2, 0)
+      assert {[{:flurry_batch, _, _, @g, e3}], s3} = Producer.maybe_emit(s2, 0)
       assert Enum.map(e3, fn {a, _} -> a end) == [5, 6]
       assert s3.priority == []
     end
 
     test "with priority non-empty and demand == 0, holds" do
       priority_batch = [entry(1)]
-      assert {[], s} = Producer.maybe_emit(state([], 0, priority: [priority_batch]), 0)
+      assert {[], s} = Producer.maybe_emit(state(%{}, 0, priority: [{@g, priority_batch}]), 0)
       assert length(s.priority) == 1
     end
 
     test "after priority drains, emission falls back to pending logic" do
-      s0 = state([entry(1)], 1)
-      assert {[{:flurry_batch, _, _, entries}], s1} = Producer.maybe_emit(s0, 0)
+      s0 = single_group([entry(1)], 1)
+      assert {[{:flurry_batch, _, _, @g, entries}], _s1} = Producer.maybe_emit(s0, 0)
       assert Enum.map(entries, fn {a, _} -> a end) == [1]
-      assert s1.pending == []
     end
 
     test "priority flush does NOT mix with pending even if pending is non-empty" do
       priority_batch = [entry(1)]
-      # Pending has a bunch of stuff that would otherwise get flushed.
       pending = Enum.map([10, 11, 12], &entry/1)
 
-      assert {[{:flurry_batch, _, _, entries}], s} =
+      assert {[{:flurry_batch, _, _, @g, entries}], s} =
                Producer.maybe_emit(
-                 state(pending, 1, priority: [priority_batch]),
+                 single_group(pending, 1, priority: [{@g, priority_batch}]),
                  0
                )
 
-      # Exactly the priority batch, nothing more.
       assert Enum.map(entries, fn {arg, _} -> arg end) == [1]
-      # Pending still has all 3 waiting.
-      assert length(s.pending) == 3
+      assert length(s.pending[@g]) == 3
     end
   end
 
   describe "multi-cycle drain" do
-    # Simulates what happens when the producer has many more items than can
-    # fit in one batch_size cap. Each maybe_emit call should flush exactly
-    # one batch of at most batch_size, decrement demand, and leave the rest
-    # pending. Subsequent calls (triggered by handle_demand from the
-    # consumer) drain progressively until pending is empty.
     test "emits one capped batch per maybe_emit call; remainder flushes next cycle" do
       pending = Enum.map(1..25, &entry/1)
-      s0 = state(pending, 1, batch_size: 10)
+      s0 = single_group(pending, 1, batch_size: 10)
 
-      # Cycle 1: emit first 10, keep 15, demand exhausted.
-      {[{:flurry_batch, _, _, batch1}], s1} = Producer.maybe_emit(s0, 0)
+      {[{:flurry_batch, _, _, @g, batch1}], s1} = Producer.maybe_emit(s0, 0)
       assert length(batch1) == 10
-      assert length(s1.pending) == 15
+      assert length(s1.pending[@g]) == 15
       assert s1.demand == 0
 
-      # Simulate consumer asking for more demand.
       s1 = %{s1 | demand: 1}
-
-      # Cycle 2: emit next 10, keep 5.
-      {[{:flurry_batch, _, _, batch2}], s2} = Producer.maybe_emit(s1, 0)
+      {[{:flurry_batch, _, _, @g, batch2}], s2} = Producer.maybe_emit(s1, 0)
       assert length(batch2) == 10
-      assert length(s2.pending) == 5
-      assert s2.demand == 0
+      assert length(s2.pending[@g]) == 5
 
-      # Cycle 3: emit remaining 5.
       s2 = %{s2 | demand: 1}
-      {[{:flurry_batch, _, _, batch3}], s3} = Producer.maybe_emit(s2, 0)
+      {[{:flurry_batch, _, _, @g, batch3}], s3} = Producer.maybe_emit(s2, 0)
       assert length(batch3) == 5
-      assert s3.pending == []
-      assert s3.demand == 0
+      assert s3.pending == %{}
+      assert s3.group_order == []
+    end
+  end
+
+  describe "multi-group" do
+    # Multi-group tests: the producer holds per-group pending lists and
+    # per-group priority items. Emission picks which group to flush based
+    # on (a) batch_size saturation of any specific group, or (b) LRU
+    # ordering via group_order when mailbox is empty.
+
+    @ga {1, true}
+    @gb {2, true}
+    @gc {1, false}
+
+    test "distinct groups get flushed as separate events, not merged" do
+      entry_a = entry(1)
+      entry_b = entry(2)
+
+      s0 =
+        state(
+          %{@ga => [entry_a], @gb => [entry_b]},
+          1,
+          group_order: [@ga, @gb]
+        )
+
+      # First flush: oldest group in group_order.
+      assert {[{:flurry_batch, _, _, @ga, [^entry_a]}], s1} = Producer.maybe_emit(s0, 0)
+      # Group A's entry was flushed and the group is empty — drop it from pending AND group_order.
+      refute Map.has_key?(s1.pending, @ga)
+      refute @ga in s1.group_order
+      # Group B still waiting.
+      assert s1.pending[@gb] == [entry_b]
+      assert @gb in s1.group_order
+    end
+
+    test "LRU: when mailbox empty, flushes the front of group_order first" do
+      # group_order [ga, gb, gc] means ga is least-recently-used.
+      pending = %{
+        @ga => [entry(1)],
+        @gb => [entry(2)],
+        @gc => [entry(3)]
+      }
+
+      s0 = state(pending, 1, group_order: [@ga, @gb, @gc])
+
+      assert {[{:flurry_batch, _, _, @ga, _}], _} = Producer.maybe_emit(s0, 0)
+    end
+
+    test "after flushing a group with remaining entries, it rotates to the back of group_order" do
+      pending = %{
+        @ga => Enum.map(1..5, &entry/1),
+        @gb => [entry(10)]
+      }
+
+      s0 = state(pending, 1, group_order: [@ga, @gb], batch_size: 3)
+
+      # Group A has 5 pending > batch_size=3, so it flushes 3 and keeps 2.
+      # It should rotate to the back of group_order.
+      assert {[{:flurry_batch, _, _, @ga, batch}], s1} = Producer.maybe_emit(s0, 5)
+      assert length(batch) == 3
+      assert length(s1.pending[@ga]) == 2
+      # Rotated: @gb now comes before @ga.
+      assert s1.group_order == [@gb, @ga]
+    end
+
+    test "a group that saturates batch_size is flushed even when mailbox is non-empty" do
+      # ga has 10, which >= batch_size 10 → flush regardless of mailbox.
+      # gb has only 2, should not flush yet (under batch_size, non-empty mailbox).
+      pending = %{
+        @ga => Enum.map(1..10, &entry/1),
+        @gb => [entry(100), entry(101)]
+      }
+
+      s0 = state(pending, 1, group_order: [@gb, @ga], batch_size: 10)
+
+      assert {[{:flurry_batch, _, _, @ga, _}], s1} = Producer.maybe_emit(s0, 5)
+      # gb is unchanged.
+      assert length(s1.pending[@gb]) == 2
+      # ga emptied out → dropped.
+      refute Map.has_key?(s1.pending, @ga)
+    end
+
+    test "empty groups are dropped from pending AND group_order on flush" do
+      s0 = state(%{@ga => [entry(1)]}, 1, group_order: [@ga])
+      assert {[_], s1} = Producer.maybe_emit(s0, 0)
+      assert s1.pending == %{}
+      assert s1.group_order == []
+    end
+
+    test "priority items are routed to their tagged group and don't cross-pollinate" do
+      # Pending has work in gb, priority has a batch for ga.
+      pending = %{@gb => Enum.map(1..3, &entry/1)}
+      priority_batch_a = Enum.map(100..102, &entry/1)
+      s0 = state(pending, 1, group_order: [@gb], priority: [{@ga, priority_batch_a}])
+
+      # Priority wins: emit ga's priority batch. gb pending untouched.
+      assert {[{:flurry_batch, _, _, @ga, entries}], s1} = Producer.maybe_emit(s0, 0)
+      assert Enum.map(entries, fn {a, _} -> a end) == [100, 101, 102]
+      assert length(s1.pending[@gb]) == 3
     end
   end
 end

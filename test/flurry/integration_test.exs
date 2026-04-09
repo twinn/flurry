@@ -206,6 +206,110 @@ defmodule Flurry.IntegrationTest do
     end
   end
 
+  describe "multi-arg / group-keyed batching" do
+    # A decorated function with more than one argument. The first argument
+    # is the batched variable; the remaining arguments form the group key.
+    # Callers sharing the same group key get coalesced into one bulk fn
+    # invocation; callers with different group keys run in independent
+    # batches.
+    defmodule GroupedBatcher do
+      @moduledoc false
+      use Flurry
+
+      @decorate batch(get_post(slug, user_id, active?))
+      def get_many_posts(slugs, user_id, active?) do
+        Agent.update(__MODULE__.Sink, fn s ->
+          %{s | calls: [{slugs, user_id, active?} | s.calls]}
+        end)
+
+        for slug <- slugs do
+          %{slug: slug, user_id: user_id, active: active?}
+        end
+      end
+    end
+
+    setup do
+      {:ok, _} = Agent.start(fn -> %{calls: []} end, name: GroupedBatcher.Sink)
+      start_supervised!(GroupedBatcher)
+      on_exit(fn -> safe_agent_stop(GroupedBatcher.Sink) end)
+      :ok
+    end
+
+    test "each caller gets the correct record" do
+      result = GroupedBatcher.get_post("a", 1, true)
+      assert result == %{slug: "a", user_id: 1, active: true}
+    end
+
+    test "distinct groups run as independent bulk calls, never mixed" do
+      # Fire a burst with three distinct groups:
+      # - {1, true}: slugs "a", "b"
+      # - {2, true}: slug  "c"
+      # - {1, false}: slug "d"
+      tasks = [
+        Task.async(fn -> GroupedBatcher.get_post("a", 1, true) end),
+        Task.async(fn -> GroupedBatcher.get_post("b", 1, true) end),
+        Task.async(fn -> GroupedBatcher.get_post("c", 2, true) end),
+        Task.async(fn -> GroupedBatcher.get_post("d", 1, false) end)
+      ]
+
+      results = Task.await_many(tasks, 5_000)
+
+      # Every caller got their record back with the right context.
+      assert [
+               %{slug: "a", user_id: 1, active: true},
+               %{slug: "b", user_id: 1, active: true},
+               %{slug: "c", user_id: 2, active: true},
+               %{slug: "d", user_id: 1, active: false}
+             ] = results
+
+      # Inspect the bulk fn invocations: each invocation should have a
+      # single group (one (user_id, active?) pair), never mixed.
+      calls = Agent.get(GroupedBatcher.Sink, & &1.calls)
+
+      for {_slugs, _user_id, _active?} <- calls do
+        :ok
+      end
+
+      # Group every bulk call by its (user_id, active?) pair and verify we
+      # saw all three distinct groups.
+      groups_seen =
+        calls
+        |> Enum.map(fn {_slugs, u, a} -> {u, a} end)
+        |> Enum.uniq()
+        |> Enum.sort()
+
+      assert Enum.sort([{1, true}, {2, true}, {1, false}]) == groups_seen
+
+      # The {1, true} group should have flushed with both slugs together
+      # (or as two singletons, depending on timing) — but the slugs should
+      # always match the group.
+      for {slugs, user_id, active?} <- calls do
+        for slug <- slugs do
+          expected = {slug, user_id, active?}
+          assert expected in [{"a", 1, true}, {"b", 1, true}, {"c", 2, true}, {"d", 1, false}]
+        end
+      end
+    end
+
+    test "callers in the same group coalesce" do
+      # 10 concurrent callers, all in the same group {1, true} — they
+      # should all pile into one or two bulk calls, not ten.
+      tasks =
+        for i <- 1..10 do
+          slug = "slug-#{i}"
+          Task.async(fn -> GroupedBatcher.get_post(slug, 1, true) end)
+        end
+
+      results = Task.await_many(tasks, 5_000)
+      assert length(results) == 10
+      assert Enum.all?(results, &match?(%{user_id: 1, active: true}, &1))
+
+      calls = Agent.get(GroupedBatcher.Sink, & &1.calls)
+      # Under heavy coalescing, we expect < 10 bulk calls.
+      assert length(calls) < 10
+    end
+  end
+
   describe ":bisect error strategy" do
     # A BisectBatcher that fails loudly whenever the batch contains id=8.
     # Goal: id=8 gets isolated and its caller gets an error; every other
