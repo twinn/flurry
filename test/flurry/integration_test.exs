@@ -548,6 +548,63 @@ defmodule Flurry.IntegrationTest do
     end
   end
 
+  describe "override the generated entry point" do
+    # Users who want to wrap the generated singular entry point declare
+    # the name in `use Flurry, overridable: [name: arity]`. __using__
+    # emits a delegate + defoverridable BEFORE the user's module body,
+    # so any later `def name/arity` becomes a legitimate override with
+    # working `super/N`.
+    defmodule OverridingBatcher do
+      @moduledoc false
+      use Flurry, repo: :none, overridable: [get: 1]
+
+      @decorate batch(get(id))
+      def get_many(ids) do
+        Enum.map(ids, &%{id: &1, name: "record-#{&1}"})
+      end
+
+      # User-defined override. super(id) invokes the batched delegate.
+      def get(id) do
+        case super(id) do
+          nil -> nil
+          record -> record.name
+        end
+      end
+    end
+
+    defmodule OverridingMultiArgBatcher do
+      @moduledoc false
+      use Flurry, repo: :none, overridable: [get_post: 2]
+
+      @decorate batch(get_post(slug, user_id))
+      def get_many(slugs, user_id) do
+        Enum.map(slugs, &%{slug: &1, user_id: user_id})
+      end
+
+      def get_post(slug, user_id) do
+        case super(slug, user_id) do
+          nil -> nil
+          record -> Map.put(record, :overridden, true)
+        end
+      end
+    end
+
+    setup do
+      start_supervised!(OverridingBatcher)
+      start_supervised!(OverridingMultiArgBatcher)
+      :ok
+    end
+
+    test "user-defined get/1 replaces the generated one and super/1 calls it" do
+      assert OverridingBatcher.get(42) == "record-42"
+    end
+
+    test "override works for multi-arg generated functions as well" do
+      assert %{slug: "hello", user_id: 1, overridden: true} =
+               OverridingMultiArgBatcher.get_post("hello", 1)
+    end
+  end
+
   describe "error propagation" do
     test "an exception in the bulk function is delivered to all callers" do
       defmodule Exploder do

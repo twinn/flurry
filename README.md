@@ -119,6 +119,59 @@ When more requests pile up than `batch_size` allows, Flurry flushes
 `batch_size` at a time across successive cycles, respecting the cap
 on every emission.
 
+### `overridable:` on `use Flurry` — wrap the generated function with `super/1`
+
+By default, the generated singular entry point (`get/1` in the
+examples above) isn't overridable — writing your own `def get/1` in
+the same module produces a redefinition error. When you want to wrap
+the generated function with extra logic, declare the name + arity on
+`use Flurry`:
+
+```elixir
+defmodule MyApp.UserBatcher do
+  use Flurry, repo: MyApp.Repo, overridable: [get: 1]
+
+  @decorate batch(get(id))
+  def get_many(ids) do
+    Repo.all(from u in User, where: u.id in ^ids)
+  end
+
+  # Overrides the generated `get/1`. `super(id)` invokes the batched
+  # implementation.
+  def get(id) do
+    case super(id) do
+      nil -> nil
+      user -> %{user | display_name: "[#{user.id}] #{user.name}"}
+    end
+  end
+end
+```
+
+`overridable:` takes a keyword list of `name: arity` pairs. For each
+entry, Flurry injects a delegate + `defoverridable` at the top of
+your module *before* your function body is parsed — that's what lets
+your subsequent `def get/1` become a legitimate override and reach
+the batched implementation via `super/1`.
+
+At compile time, Flurry validates that every `:overridable` entry has
+a matching `@decorate batch(...)` decoration with the same arity.
+Both of these raise `CompileError`:
+
+```elixir
+# No matching decoration:
+use Flurry, repo: :none, overridable: [get_by_email: 1]
+# (no @decorate batch(get_by_email(...)))
+
+# Arity mismatch:
+use Flurry, repo: :none, overridable: [get: 1]
+@decorate batch(get(id, user_id))   # decorator declares arity 2
+def get_many(ids, user_id), do: ...
+```
+
+Without `overridable:`, the generated function is a plain `def` — no
+`defoverridable`, no super, and attempting to redefine it in the
+module body is a compile error.
+
 ### `batch_by:` — normalize what defines a batch
 
 For multi-arg decorations, the additional arguments beyond the
@@ -433,10 +486,17 @@ calling `enable_bypass_globally()` for that suite.
   record. Computed keys, MFA callbacks, and anonymous functions are
   not supported today — if you need them, transform your bulk
   function's output to expose a matchable field before returning.
+- **The bulk function bypasses the pipeline.** Calling your
+  user-defined `get_many/1` (the plural, decorated function)
+  directly runs in the caller's process with its own DB connection
+  — it does not coalesce with concurrent singular callers. Callers
+  with a list of ids in hand who want to participate in batching
+  currently have to call `get/1` per element via `Task.async_stream`.
+  Tracked in [issue #2](https://github.com/twinn/flurry/issues/2).
 - **Additive argument merging isn't supported yet.** Arguments that
   should be unioned across coalesced callers (the motivating case is
-  a `preloads:` list for Ecto queries — different callers may ask for
-  different preloads and the batch should load their union) are
+  a `preloads:` list for Ecto queries — different callers may ask
+  for different preloads and the batch should load their union) are
   tracked in [issue #1](https://github.com/twinn/flurry/issues/1).
   For now, either pre-compute the union at the call site or use
   distinct decorated functions per preload shape.

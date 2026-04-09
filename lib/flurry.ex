@@ -121,33 +121,78 @@ defmodule Flurry do
           """
       end
 
-    quote bind_quoted: [repo: repo] do
+    overridable = Keyword.get(opts, :overridable, [])
+    validate_overridable_list!(overridable)
+
+    # Emit a delegate + defoverridable for each overridable entry. The
+    # delegate calls `_flurry_<name>/N`, which __before_compile__ will
+    # generate with the full batched body. Forward reference is safe —
+    # Elixir resolves same-module function calls at call time.
+    overridable_defs =
+      for {name, arity} <- overridable do
+        vars = for i <- 1..arity, do: Macro.var(:"arg#{i}", nil)
+        helper_name = :"_flurry_#{name}"
+
+        quote do
+          def unquote(name)(unquote_splicing(vars)) do
+            unquote(helper_name)(unquote_splicing(vars))
+          end
+
+          defoverridable [{unquote(name), unquote(arity)}]
+        end
+      end
+
+    quote do
       use Flurry.Decorators
 
       Module.register_attribute(__MODULE__, :flurry_batches, accumulate: true)
-      Module.put_attribute(__MODULE__, :flurry_repo, repo)
+      Module.put_attribute(__MODULE__, :flurry_repo, unquote(repo))
+      Module.put_attribute(__MODULE__, :flurry_overridable, unquote(overridable))
       @before_compile Flurry
+
+      unquote_splicing(overridable_defs)
     end
+  end
+
+  defp validate_overridable_list!(overridable) when is_list(overridable) do
+    if !Keyword.keyword?(overridable) do
+      raise ArgumentError,
+            "Flurry: `:overridable` must be a keyword list of name: arity pairs, " <>
+              "e.g. `overridable: [get: 1, get_by_email: 1]`. Got: #{inspect(overridable)}"
+    end
+
+    for {name, arity} <- overridable do
+      if !(is_atom(name) and is_integer(arity) and arity > 0) do
+        raise ArgumentError,
+              "Flurry: invalid `:overridable` entry #{inspect({name, arity})} — " <>
+                "each entry must be `atom: positive_integer`."
+      end
+    end
+
+    :ok
+  end
+
+  defp validate_overridable_list!(other) do
+    raise ArgumentError,
+          "Flurry: `:overridable` must be a keyword list of name: arity pairs, " <>
+            "got: #{inspect(other)}"
   end
 
   @doc false
   defmacro __before_compile__(env) do
     repo = Module.get_attribute(env.module, :flurry_repo)
+    overridable = Module.get_attribute(env.module, :flurry_overridable) || []
     raw_batches = env.module |> Module.get_attribute(:flurry_batches) |> Enum.reverse()
     batches = Enum.map(raw_batches, &resolve_in_transaction(&1, repo, env.module))
+
+    :ok = validate_overridable_vs_batches!(overridable, batches, env.module)
 
     # Persist the resolved batches back so `__flurry_batches__/0` reflects
     # the post-resolution view.
     Module.delete_attribute(env.module, :flurry_batches)
-
-    Enum.each(batches, fn batch ->
-      Module.put_attribute(env.module, :flurry_batches, batch)
-    end)
-
+    Enum.each(batches, &Module.put_attribute(env.module, :flurry_batches, &1))
     batches = Enum.reverse(batches)
 
-    # Pre-compute the two possible return-type specs once, outside the
-    # per-batch loop, so the loop can look them up without a branch.
     return_types = %{
       one: quote(do: term() | nil | {:error, Exception.t()}),
       list: quote(do: [term()] | {:error, Exception.t()})
@@ -155,38 +200,7 @@ defmodule Flurry do
 
     singular_defs =
       for batch <- batches do
-        batched_var = Macro.var(batch.key, nil)
-        group_vars = Enum.map(batch.group_args, &Macro.var(&1, nil))
-        all_vars = [batched_var | group_vars]
-
-        spec_arg_types = List.duplicate(quote(do: term()), length(all_vars))
-        return_type = return_types[batch.returns]
-
-        spec_ast =
-          quote do
-            @spec unquote(batch.singular)(unquote_splicing(spec_arg_types)) ::
-                    unquote(return_type)
-          end
-
-        # {:{}, [], vars} is the AST for ANY-arity tuple and evaluates
-        # correctly for 0, 1, or 2+ elements — no need to case on empty.
-        raw_group_tuple_ast = {:{}, [], group_vars}
-
-        # `batch_by: &1` when absent is a no-op identity function — the
-        # extra call site is negligible, and this collapses the nil/not
-        # branches into a single generated-code shape.
-        normalizer_ast = batch.batch_by || quote(do: & &1)
-        group_tuple_ast = quote(do: unquote(normalizer_ast).(unquote(raw_group_tuple_ast)))
-
-        body_ast = build_entry_body(batch, repo, batched_var, all_vars, group_tuple_ast)
-
-        quote do
-          unquote(spec_ast)
-
-          def unquote(batch.singular)(unquote_splicing(all_vars)) do
-            unquote(body_ast)
-          end
-        end
+        build_batch_entry_defs(batch, repo, return_types, overridable)
       end
 
     # `:batch_by` is compile-time-only AST — strip it from the runtime
@@ -214,6 +228,88 @@ defmodule Flurry do
 
       unquote_splicing(singular_defs)
     end
+  end
+
+  # Builds the generated code for one batch. Always emits a
+  # `_flurry_<singular>/N` helper containing the full batched implementation.
+  # The public `<singular>/N` is a thin delegate — when :overridable lists
+  # this name, __using__ already injected the delegate + defoverridable, so
+  # we skip emitting it here to avoid a redefinition.
+  defp build_batch_entry_defs(batch, repo, return_types, overridable) do
+    batched_var = Macro.var(batch.key, nil)
+    group_vars = Enum.map(batch.group_args, &Macro.var(&1, nil))
+    all_vars = [batched_var | group_vars]
+    arity = length(all_vars)
+
+    spec_arg_types = List.duplicate(quote(do: term()), arity)
+    return_type = return_types[batch.returns]
+
+    raw_group_tuple_ast = {:{}, [], group_vars}
+    normalizer_ast = batch.batch_by || quote(do: & &1)
+    group_tuple_ast = quote(do: unquote(normalizer_ast).(unquote(raw_group_tuple_ast)))
+
+    body_ast = build_entry_body(batch, repo, batched_var, all_vars, group_tuple_ast)
+
+    helper_name = :"_flurry_#{batch.singular}"
+    is_overridable = Keyword.get(overridable, batch.singular) == arity
+
+    helper_def =
+      quote do
+        @doc false
+        @spec unquote(helper_name)(unquote_splicing(spec_arg_types)) :: unquote(return_type)
+        def unquote(helper_name)(unquote_splicing(all_vars)) do
+          unquote(body_ast)
+        end
+      end
+
+    # When the user opted into `overridable: [name: arity]`, the public
+    # `name/arity` delegate and `defoverridable` were emitted in __using__.
+    # We skip re-emitting the delegate here to avoid redefinition.
+    public_def =
+      if is_overridable do
+        quote(do: nil)
+      else
+        quote do
+          @spec unquote(batch.singular)(unquote_splicing(spec_arg_types)) ::
+                  unquote(return_type)
+          def unquote(batch.singular)(unquote_splicing(all_vars)) do
+            unquote(helper_name)(unquote_splicing(all_vars))
+          end
+        end
+      end
+
+    quote do
+      unquote(helper_def)
+      unquote(public_def)
+    end
+  end
+
+  # Raises CompileError if any :overridable entry has no matching
+  # @decorate batch, or if arities don't line up.
+  defp validate_overridable_vs_batches!(overridable, batches, module) do
+    for {name, declared_arity} <- overridable do
+      batch =
+        Enum.find(batches, &(&1.singular == name)) ||
+          raise CompileError,
+            description:
+              "Flurry: #{inspect(module)} declared `overridable: [#{name}: #{declared_arity}]` " <>
+                "but no `@decorate batch(#{name}(...))` decoration was found. " <>
+                "Either add a matching decorator on a bulk function in this module, or " <>
+                "remove #{inspect(name)} from the :overridable list."
+
+      actual_arity = 1 + length(batch.group_args)
+
+      if actual_arity != declared_arity do
+        raise CompileError,
+          description:
+            "Flurry: #{inspect(module)} declared `overridable: [#{name}: #{declared_arity}]` " <>
+              "but the `@decorate batch(#{name}(...))` on #{batch.bulk}/#{batch.arity} " <>
+              "has arity #{actual_arity} (1 batched arg + #{length(batch.group_args)} group args). " <>
+              "Update the :overridable arity to match."
+      end
+    end
+
+    :ok
   end
 
   # Fills in the default :in_transaction value based on the module's :repo

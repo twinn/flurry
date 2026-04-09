@@ -251,6 +251,68 @@ defmodule FlurryTest do
       end
     end
 
+    test ":overridable with a non-keyword-list raises at compile time" do
+      ast =
+        quote do
+          defmodule BadOverridableShape do
+            @moduledoc false
+            use Flurry, repo: :none, overridable: [:get, :get_by_email]
+          end
+        end
+
+      assert_raise ArgumentError, ~r/must be a keyword list/, fn ->
+        Code.eval_quoted(ast)
+      end
+    end
+
+    test ":overridable with a negative arity raises at compile time" do
+      ast =
+        quote do
+          defmodule BadOverridableArity do
+            @moduledoc false
+            use Flurry, repo: :none, overridable: [get: -1]
+          end
+        end
+
+      assert_raise ArgumentError, ~r/must be `atom: positive_integer`/, fn ->
+        Code.eval_quoted(ast)
+      end
+    end
+
+    test ":overridable entry with no matching decoration raises at compile time" do
+      ast =
+        quote do
+          defmodule OverridableWithoutDecoration do
+            @moduledoc false
+            use Flurry, repo: :none, overridable: [get: 1, get_by_email: 1]
+
+            @decorate batch(get(id))
+            def get_many(ids), do: Enum.map(ids, &%{id: &1})
+          end
+        end
+
+      assert_raise CompileError, ~r/overridable.*get_by_email/, fn ->
+        Code.eval_quoted(ast)
+      end
+    end
+
+    test ":overridable entry with wrong arity raises at compile time" do
+      ast =
+        quote do
+          defmodule OverridableArityMismatch do
+            @moduledoc false
+            use Flurry, repo: :none, overridable: [get: 1]
+
+            @decorate batch(get(id, user_id))
+            def get_many(ids, user_id), do: Enum.map(ids, &%{id: &1, user_id: user_id})
+          end
+        end
+
+      assert_raise CompileError, ~r/has arity 2/, fn ->
+        Code.eval_quoted(ast)
+      end
+    end
+
     test ":batch_by with a non-function value raises at compile time" do
       ast =
         quote do
