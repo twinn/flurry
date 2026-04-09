@@ -424,6 +424,57 @@ defmodule Flurry.IntegrationTest do
     end
   end
 
+  describe "correlate: override" do
+    # A batcher whose records use a DIFFERENT field name than the
+    # decorated arg. Default behavior would use :id; we override to
+    # :uuid so results are matched by the record's :uuid field.
+    defmodule RenamedCorrelateBatcher do
+      @moduledoc false
+      use Flurry, repo: :none
+
+      @decorate batch(get(id), correlate: :uuid)
+      def get_many(ids) do
+        Enum.map(ids, fn id -> %{uuid: id, name: "item-#{id}"} end)
+      end
+    end
+
+    setup do
+      start_supervised!(RenamedCorrelateBatcher)
+      :ok
+    end
+
+    test "correlates by the overridden field name, not the arg name" do
+      assert %{uuid: 42, name: "item-42"} = RenamedCorrelateBatcher.get(42)
+      assert %{uuid: "abc", name: "item-abc"} = RenamedCorrelateBatcher.get("abc")
+    end
+  end
+
+  describe "timeout: override" do
+    # A batcher whose bulk fn sleeps longer than the decorator's timeout.
+    # The caller should see an exit (from GenServer.call timeout), proving
+    # the timeout actually takes effect.
+    defmodule SlowBatcher do
+      @moduledoc false
+      use Flurry, repo: :none
+
+      @decorate batch(get(id), timeout: 50)
+      def get_many(ids) do
+        Process.sleep(200)
+        Enum.map(ids, &%{id: &1})
+      end
+    end
+
+    setup do
+      start_supervised!(SlowBatcher)
+      :ok
+    end
+
+    test "caller exits with :timeout when the bulk fn is slower than the decorator's timeout" do
+      # Using safe_call to catch the GenServer.call exit cleanly.
+      assert {:error, {:timeout, _}} = safe_call(fn -> SlowBatcher.get(1) end)
+    end
+  end
+
   describe "error propagation" do
     test "an exception in the bulk function is delivered to all callers" do
       defmodule Exploder do

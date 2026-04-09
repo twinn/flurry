@@ -119,6 +119,46 @@ When more requests pile up than `batch_size` allows, Flurry flushes
 `batch_size` at a time across successive cycles, respecting the cap
 on every emission.
 
+### `correlate: :field_name`
+
+By default, Flurry uses the first decorator argument's name as both the
+generated parameter name *and* the record field to correlate by. Use
+`correlate:` when the record's field name differs from the caller's arg
+name:
+
+```elixir
+# Decorated arg is `id`, but records have a `:uuid` field.
+@decorate batch(get(id), correlate: :uuid)
+def get_many(ids) do
+  Repo.all(from r in Row, where: r.uuid in ^ids)
+end
+
+MyApp.RowBatcher.get(42)   # => %{uuid: 42, ...}
+```
+
+The caller's `id` is matched against each returned record's `:uuid`
+field. Useful when your app's naming (`id`) differs from your
+underlying schema (`uuid`, `external_id`, etc.).
+
+### `timeout: milliseconds`
+
+The underlying `GenServer.call/3` timeout for the generated entry
+point. Defaults to `5_000` (5 seconds). Override per decorator when
+your bulk function's work dominates the wait — e.g. a batched query
+over a large row set, or a remote API coalescer with its own
+latency budget:
+
+```elixir
+@decorate batch(get(id), timeout: 30_000)
+def get_many(ids) do
+  Repo.all(from u in User, where: u.id in ^ids, preload: [:posts, :comments])
+end
+```
+
+If the bulk function takes longer than `timeout`, the caller exits
+with a `:timeout` reason — the same behavior as any `GenServer.call`
+timeout.
+
 ### `returns: :one | :list`
 
 Default `:one` — each caller's argument corresponds to at most one
@@ -334,20 +374,16 @@ calling `enable_bypass_globally()` for that suite.
 
 ## Limitations
 
-- **No arbitrary correlation functions.** The record field used for
-  correlation is always the same atom as the first argument's name.
-  If your record has a differently-named field, wrap your bulk
-  function to rename the field before returning.
+- **Correlation is by a single field atom.** The `correlate:` option
+  picks which record field to match against the caller's argument,
+  but it must be an atom naming a top-level field on the returned
+  record. Computed keys, MFA callbacks, and anonymous functions are
+  not supported today — if you need them, transform your bulk
+  function's output to expose a matchable field before returning.
 - **Group keys must be structurally comparable.** Tuples of atoms,
   numbers, and binaries work. Maps and structs are compared
   structurally by Elixir, which works but may surprise you with
   order-insensitive equality.
-- **Single-node.** Flurry's GenStage pipeline runs in-process on one
-  node; there is no cluster-aware coalescing.
-- **Per-call timeout is a module-level default.** `GenServer.call`
-  in `Flurry.Runtime.call/4` defaults to 5 seconds. If your bulk
-  function is slow enough to risk timeouts, increase it via the
-  producer config (or open an issue — we'll make it per-call).
 
 ## License
 

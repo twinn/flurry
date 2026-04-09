@@ -42,37 +42,43 @@ defmodule Flurry.Decorators do
     # the decorator can't see. Store nil here and let before_compile fill
     # it in based on the repo.
     in_transaction = Keyword.get(opts, :in_transaction)
+    # `correlate` defaults to the first arg's name, i.e. the same as
+    # `key`. Users override when the record's field name differs from
+    # the caller's arg name.
+    correlate = Keyword.get(opts, :correlate, key)
+    timeout = Keyword.get(opts, :timeout, 5_000)
 
-    if returns not in [:one, :list] do
-      raise ArgumentError,
-            "Flurry: invalid `:returns` option #{inspect(returns)} — must be :one or :list"
-    end
+    # Data-driven validation: `for` walks the list once and raises on the
+    # first invalid entry. Adding a new option is a one-liner here, and
+    # the cyclomatic complexity of `register/3` stays flat regardless of
+    # how many options we add.
+    validators = [
+      {:returns, returns, &(&1 in [:one, :list]), "must be :one or :list"},
+      {:batch_size, batch_size, &(&1 == nil or (is_integer(&1) and &1 > 0)), "must be a positive integer"},
+      {:on_failure, on_failure, &(&1 in [:fail_all, :bisect]), "must be :fail_all or :bisect"},
+      {:in_transaction, in_transaction, &(&1 == nil or &1 in [:warn, :safe, :bypass]),
+       "must be :warn, :safe, or :bypass"},
+      {:correlate, correlate, &is_atom/1, "must be an atom (the record field name to correlate by)"},
+      {:timeout, timeout, &(is_integer(&1) and &1 > 0), "must be a positive integer (milliseconds)"}
+    ]
 
-    if batch_size != nil and not (is_integer(batch_size) and batch_size > 0) do
+    for {name, value, valid?, desc} <- validators, not valid?.(value) do
       raise ArgumentError,
-            "Flurry: invalid `:batch_size` option #{inspect(batch_size)} — must be a positive integer"
-    end
-
-    if on_failure not in [:fail_all, :bisect] do
-      raise ArgumentError,
-            "Flurry: invalid `:on_failure` option #{inspect(on_failure)} — must be :fail_all or :bisect"
-    end
-
-    if in_transaction != nil and in_transaction not in [:warn, :safe, :bypass] do
-      raise ArgumentError,
-            "Flurry: invalid `:in_transaction` option #{inspect(in_transaction)} — must be :warn, :safe, or :bypass"
+            "Flurry: invalid `#{inspect(name)}` option #{inspect(value)} — #{desc}"
     end
 
     Module.put_attribute(context.module, :flurry_batches, %{
       singular: singular,
       key: key,
+      correlate: correlate,
       group_args: group_args,
       bulk: context.name,
       arity: context.arity,
       returns: returns,
       batch_size: batch_size,
       on_failure: on_failure,
-      in_transaction: in_transaction
+      in_transaction: in_transaction,
+      timeout: timeout
     })
   end
 

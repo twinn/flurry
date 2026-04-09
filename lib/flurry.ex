@@ -250,6 +250,7 @@ defmodule Flurry do
   # when `Flurry.Testing.bypass?()` is true.
   defp build_entry_body(batch, repo, batched_var, all_vars, group_tuple_ast) do
     singular = batch.singular
+    timeout = batch.timeout
 
     runtime_call_ast =
       quote do
@@ -257,7 +258,8 @@ defmodule Flurry do
           __MODULE__,
           unquote(singular),
           unquote(batched_var),
-          unquote(group_tuple_ast)
+          unquote(group_tuple_ast),
+          unquote(timeout)
         )
       end
 
@@ -304,7 +306,7 @@ defmodule Flurry do
   # by `:bypass` mode when inside a transaction.
   defp build_inline_body(batch, batched_var, all_vars) do
     bulk = batch.bulk
-    key = batch.key
+    correlate = batch.correlate
     returns = batch.returns
     group_vars = tl(all_vars)
 
@@ -312,7 +314,7 @@ defmodule Flurry do
 
     quote do
       result = apply(__MODULE__, unquote(bulk), unquote(bulk_call_args))
-      correlated = Flurry.Consumer.correlate(result, unquote(key), unquote(returns))
+      correlated = Flurry.Consumer.correlate(result, unquote(correlate), unquote(returns))
       Flurry.Consumer.lookup(correlated, unquote(batched_var), unquote(returns))
     end
   end

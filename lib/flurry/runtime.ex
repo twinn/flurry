@@ -11,11 +11,14 @@ defmodule Flurry.Runtime do
   `group_key` is a tuple of the non-batched arguments (empty `{}` for
   single-arg decorations). Callers sharing the same group key get coalesced
   into the same batch; distinct groups run as independent batches.
+
+  `timeout` is the underlying `GenServer.call/3` timeout — i.e. how long
+  the caller will block waiting for the batched result.
   """
-  @spec call(module(), atom(), term(), tuple()) :: term()
-  def call(module, singular, arg, group_key) when is_tuple(group_key) do
+  @spec call(module(), atom(), term(), tuple(), timeout()) :: term()
+  def call(module, singular, arg, group_key, timeout) when is_tuple(group_key) do
     producer = producer_name(module, singular)
-    GenServer.call(producer, {:enqueue, group_key, arg}, 5_000)
+    GenServer.call(producer, {:enqueue, group_key, arg}, timeout)
   end
 
   @doc "Canonical producer name for a given user module + singular function."

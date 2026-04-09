@@ -50,6 +50,20 @@ defmodule FlurryTest do
       assert Enum.all?(batches, &(&1.on_failure == :bisect))
     end
 
+    test "correlate defaults to the first arg name" do
+      batches = FakeBatcher.__flurry_batches__()
+      get_batch = Enum.find(batches, &(&1.singular == :get))
+      assert get_batch.correlate == :id
+
+      group_batch = Enum.find(batches, &(&1.singular == :get_by_group))
+      assert group_batch.correlate == :group
+    end
+
+    test "timeout defaults to 5_000" do
+      batches = FakeBatcher.__flurry_batches__()
+      assert Enum.all?(batches, &(&1.timeout == 5_000))
+    end
+
     test "generated singular functions have @spec attached" do
       # Specs are stored in the compiled beam; fetch_specs returns
       # [{{name, arity}, [spec_ast]}, ...].
@@ -180,6 +194,40 @@ defmodule FlurryTest do
         end
 
       assert_raise ArgumentError, ~r/repo: :none.*require a real `:repo`/s, fn ->
+        Code.eval_quoted(ast)
+      end
+    end
+
+    test "invalid :correlate value raises at compile time" do
+      ast =
+        quote do
+          defmodule BadCorrelate do
+            @moduledoc false
+            use Flurry, repo: :none
+
+            @decorate batch(get(id), correlate: "not an atom")
+            def get_many(ids), do: ids
+          end
+        end
+
+      assert_raise ArgumentError, ~r/invalid `:correlate`/, fn ->
+        Code.eval_quoted(ast)
+      end
+    end
+
+    test "invalid :timeout value raises at compile time" do
+      ast =
+        quote do
+          defmodule BadTimeout do
+            @moduledoc false
+            use Flurry, repo: :none
+
+            @decorate batch(get(id), timeout: -1)
+            def get_many(ids), do: ids
+          end
+        end
+
+      assert_raise ArgumentError, ~r/invalid `:timeout`/, fn ->
         Code.eval_quoted(ast)
       end
     end

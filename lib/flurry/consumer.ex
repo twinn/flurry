@@ -39,7 +39,7 @@ defmodule Flurry.Consumer do
 
     try do
       results = apply(module, batch.bulk, bulk_args)
-      correlated = correlate(results, batch.key, batch.returns)
+      correlated = correlate(results, batch.correlate, batch.returns)
 
       Enum.each(entries, fn {arg, from} ->
         GenServer.reply(from, lookup(correlated, arg, batch.returns))
