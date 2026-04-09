@@ -63,7 +63,8 @@ defmodule Flurry.Decorators do
       {:on_failure, on_failure, &(&1 in [:fail_all, :bisect]), "must be :fail_all or :bisect"},
       {:in_transaction, in_transaction, &(&1 == nil or &1 in [:warn, :safe, :bypass]),
        "must be :warn, :safe, or :bypass"},
-      {:correlate, correlate, &is_atom/1, "must be an atom (the record field name to correlate by)"},
+      {:correlate, correlate, &Flurry.Decorators.valid_correlate?/1,
+       "must be an atom (record field name) or a function expression like `fn r -> r.nested.id end`"},
       {:timeout, timeout, &(is_integer(&1) and &1 > 0), "must be a positive integer (milliseconds)"},
       {:batch_by, batch_by, &(&1 == nil or Flurry.Decorators.function_ast?(&1)),
        "must be a function expression (e.g. `fn tuple -> ... end` or `&MyMod.fun/1`)"}
@@ -121,6 +122,10 @@ defmodule Flurry.Decorators do
   def function_ast?({:fn, _, _}), do: true
   def function_ast?({:&, _, _}), do: true
   def function_ast?(_), do: false
+
+  @doc false
+  def valid_correlate?(c) when is_atom(c), do: true
+  def valid_correlate?(c), do: function_ast?(c)
 
   defp arg_name!({name, _meta, ctx}, _singular) when is_atom(name) and is_atom(ctx), do: name
 

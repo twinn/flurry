@@ -221,12 +221,14 @@ Not supported: MFA tuples, atoms (use `correlate:` for field-name
 lookups), strings. `batch_by:` on a single-arg decoration raises at
 compile time (there are no additional arguments to normalize).
 
-### `correlate: :field_name`
+### `correlate:` — pick how the match key is extracted from each record
 
-By default, Flurry uses the first decorator argument's name as both the
-generated parameter name *and* the record field to correlate by. Use
-`correlate:` when the record's field name differs from the caller's arg
-name:
+By default, Flurry uses the first decorator argument's name as both
+the generated parameter name *and* the record field to correlate by.
+`correlate:` lets you override that, in two forms:
+
+**Atom (fast path):** names a top-level field on each returned
+record.
 
 ```elixir
 # Decorated arg is `id`, but records have a `:uuid` field.
@@ -238,9 +240,33 @@ end
 MyApp.RowBatcher.get(42)   # => %{uuid: 42, ...}
 ```
 
-The caller's `id` is matched against each returned record's `:uuid`
-field. Useful when your app's naming (`id`) differs from your
-underlying schema (`uuid`, `external_id`, etc.).
+**Function:** a 1-arity function that extracts the key from each
+record. Use this when the match key is computed, lives in a nested
+map, or the records aren't maps at all (tuples, structs with
+irregular shapes, etc.).
+
+```elixir
+# Records are {User, Profile} tuples from an Ecto join.
+@decorate batch(
+  get(user_id),
+  correlate: fn {user, _profile} -> user.id end
+)
+def get_many(user_ids) do
+  from(u in User,
+    join: p in Profile, on: p.user_id == u.id,
+    where: u.id in ^user_ids,
+    select: {u, p})
+  |> Repo.all()
+end
+
+# Or pulling from a nested map:
+@decorate batch(get(id), correlate: fn r -> r.meta.id end)
+def get_many(ids), do: ...
+```
+
+Both closures (`fn r -> ... end`) and captures
+(`&MyMod.extract/1`) are accepted. MFA tuples and atoms-that-aren't-
+field-names are not. Invalid values are caught at compile time.
 
 ### `timeout: milliseconds`
 
@@ -480,12 +506,6 @@ calling `enable_bypass_globally()` for that suite.
 
 ## Limitations
 
-- **Correlation is by a single field atom.** The `correlate:` option
-  picks which record field to match against the caller's argument,
-  but it must be an atom naming a top-level field on the returned
-  record. Computed keys, MFA callbacks, and anonymous functions are
-  not supported today — if you need them, transform your bulk
-  function's output to expose a matchable field before returning.
 - **The bulk function bypasses the pipeline.** Calling your
   user-defined `get_many/1` (the plural, decorated function)
   directly runs in the caller's process with its own DB connection

@@ -424,6 +424,49 @@ defmodule Flurry.IntegrationTest do
     end
   end
 
+  describe "correlate: function form" do
+    # A decorated function whose bulk fn returns records keyed by a
+    # nested value, not a top-level field. Function-form correlate lets
+    # Flurry extract the key without reshaping.
+    defmodule NestedCorrelateBatcher do
+      @moduledoc false
+      use Flurry, repo: :none
+
+      @decorate batch(get(id), correlate: fn r -> r.nested.id end)
+      def get_many(ids) do
+        Enum.map(ids, fn id -> %{nested: %{id: id}, name: "record-#{id}"} end)
+      end
+    end
+
+    # A batcher whose bulk fn returns tuples, not maps. Without the
+    # function form, Flurry couldn't correlate tuples at all.
+    defmodule TupleCorrelateBatcher do
+      @moduledoc false
+      use Flurry, repo: :none
+
+      @decorate batch(get(id), correlate: fn {id, _name} -> id end)
+      def get_many(ids) do
+        Enum.map(ids, fn id -> {id, "name-#{id}"} end)
+      end
+    end
+
+    setup do
+      start_supervised!(NestedCorrelateBatcher)
+      start_supervised!(TupleCorrelateBatcher)
+      :ok
+    end
+
+    test "extracts the correlation key from a nested map field" do
+      assert %{nested: %{id: 42}, name: "record-42"} = NestedCorrelateBatcher.get(42)
+      assert %{nested: %{id: 7}, name: "record-7"} = NestedCorrelateBatcher.get(7)
+    end
+
+    test "correlates tuple-shaped results by pattern matching in the function" do
+      assert {42, "name-42"} = TupleCorrelateBatcher.get(42)
+      assert {7, "name-7"} = TupleCorrelateBatcher.get(7)
+    end
+  end
+
   describe "correlate: override" do
     # A batcher whose records use a DIFFERENT field name than the
     # decorated arg. Default behavior would use :id; we override to

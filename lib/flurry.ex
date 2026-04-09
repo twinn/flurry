@@ -203,9 +203,24 @@ defmodule Flurry do
         build_batch_entry_defs(batch, repo, return_types, overridable)
       end
 
-    # `:batch_by` is compile-time-only AST — strip it from the runtime
-    # batch maps so Macro.escape doesn't try to serialize it.
-    runtime_batches = Enum.map(batches, &Map.delete(&1, :batch_by))
+    # Normalize batches for runtime:
+    #   * `:batch_by` is compile-time-only AST → strip it
+    #   * `:correlate` that is a function AST → replace with a
+    #     `{:fn, helper_name}` marker referring to the generated
+    #     `_flurry_correlate_<singular>/1` helper on the user module
+    runtime_batches =
+      Enum.map(batches, fn batch ->
+        batch = Map.delete(batch, :batch_by)
+
+        case batch.correlate do
+          atom when is_atom(atom) ->
+            batch
+
+          _fn_ast ->
+            helper = :"_flurry_correlate_#{batch.singular}"
+            Map.put(batch, :correlate, {:fn, helper})
+        end
+      end)
 
     quote do
       @spec __flurry_batches__() :: [map()]
@@ -262,6 +277,8 @@ defmodule Flurry do
         end
       end
 
+    correlate_helper_def = build_correlate_helper(batch)
+
     # When the user opted into `overridable: [name: arity]`, the public
     # `name/arity` delegate and `defoverridable` were emitted in __using__.
     # We skip re-emitting the delegate here to avoid redefinition.
@@ -280,7 +297,27 @@ defmodule Flurry do
 
     quote do
       unquote(helper_def)
+      unquote(correlate_helper_def)
       unquote(public_def)
+    end
+  end
+
+  # Emits `_flurry_correlate_<singular>/1` ONLY when the user gave a
+  # function-form `correlate:`. The atom form doesn't need a helper —
+  # Consumer.correlate/3 handles atoms via the fast Map.fetch! path.
+  defp build_correlate_helper(%{correlate: correlate} = batch) when is_atom(correlate) do
+    _ = batch
+    quote(do: nil)
+  end
+
+  defp build_correlate_helper(%{correlate: fn_ast} = batch) do
+    helper_name = :"_flurry_correlate_#{batch.singular}"
+
+    quote do
+      @doc false
+      def unquote(helper_name)(record) do
+        unquote(fn_ast).(record)
+      end
     end
   end
 

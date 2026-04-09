@@ -69,6 +69,47 @@ defmodule Flurry.ConsumerTest do
     end
   end
 
+  describe "correlate/3 — function key form" do
+    test ":one mode with a 1-arity function extracts keys via the function" do
+      results = [
+        %{nested: %{id: 1}, name: "a"},
+        %{nested: %{id: 2}, name: "b"}
+      ]
+
+      map = Consumer.correlate(results, fn r -> r.nested.id end, :one)
+      assert map[1].name == "a"
+      assert map[2].name == "b"
+    end
+
+    test ":one mode with a function raises on duplicate extracted keys" do
+      results = [%{nested: %{id: 1}}, %{nested: %{id: 1}}]
+
+      assert_raise Flurry.AmbiguousBatchError, fn ->
+        Consumer.correlate(results, fn r -> r.nested.id end, :one)
+      end
+    end
+
+    test ":list mode with a function groups by extracted key" do
+      results = [
+        {:alpha, 1},
+        {:alpha, 2},
+        {:beta, 3}
+      ]
+
+      map = Consumer.correlate(results, fn {tag, _} -> tag end, :list)
+      assert length(map[:alpha]) == 2
+      assert length(map[:beta]) == 1
+    end
+
+    test "function form works on tuples (no map field dependency)" do
+      results = [{1, "a"}, {2, "b"}]
+
+      map = Consumer.correlate(results, fn {id, _} -> id end, :one)
+      assert map[1] == {1, "a"}
+      assert map[2] == {2, "b"}
+    end
+  end
+
   describe "lookup/3 — matching caller args to correlated results" do
     test ":one mode returns the record or nil" do
       map = %{1 => %{id: 1, name: "a"}}

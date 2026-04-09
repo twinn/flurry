@@ -39,7 +39,8 @@ defmodule Flurry.Consumer do
 
     try do
       results = apply(module, batch.bulk, bulk_args)
-      correlated = correlate(results, batch.correlate, batch.returns)
+      key = resolve_correlate(batch.correlate, module)
+      correlated = correlate(results, key, batch.returns)
 
       Enum.each(entries, fn {arg, from} ->
         GenServer.reply(from, lookup(correlated, arg, batch.returns))
@@ -135,22 +136,39 @@ defmodule Flurry.Consumer do
       ...> )
       %{a: [%{group: :a, id: 1}, %{group: :a, id: 2}], b: [%{group: :b, id: 3}]}
   """
-  @spec correlate([map() | struct()], atom(), :one | :list) :: map()
-  def correlate(results, key, :one) do
+  @spec correlate([term()], atom() | (term() -> term()), :one | :list) :: map()
+  def correlate(results, key_or_fn, mode) do
+    key_fn = to_key_fn(key_or_fn)
+    do_correlate(results, key_fn, key_or_fn, mode)
+  end
+
+  defp to_key_fn(f) when is_function(f, 1), do: f
+  defp to_key_fn(atom) when is_atom(atom), do: &Map.fetch!(&1, atom)
+
+  # The consumer receives `batch.correlate` either as an atom (field
+  # name — fast path) or as `{:fn, helper_name}`, a marker that points
+  # at a compile-time-generated helper function on the user's module.
+  # The helper wraps the user's `correlate: fn ... end` AST.
+  defp resolve_correlate({:fn, helper_name}, module) do
+    fn record -> apply(module, helper_name, [record]) end
+  end
+
+  defp resolve_correlate(atom, _module) when is_atom(atom), do: atom
+
+  defp do_correlate(results, key_fn, key_or_fn, :one) do
     Enum.reduce(results, %{}, fn record, acc ->
-      k = Map.fetch!(record, key)
+      k = key_fn.(record)
 
       if Map.has_key?(acc, k) do
-        raise Flurry.AmbiguousBatchError,
-          message: ambiguous_message(key, k)
+        raise Flurry.AmbiguousBatchError, message: ambiguous_message(key_or_fn, k)
       end
 
       Map.put(acc, k, record)
     end)
   end
 
-  def correlate(results, key, :list) do
-    Enum.group_by(results, &Map.fetch!(&1, key))
+  defp do_correlate(results, key_fn, _key_or_fn, :list) do
+    Enum.group_by(results, key_fn)
   end
 
   @doc """
@@ -174,7 +192,7 @@ defmodule Flurry.Consumer do
   def lookup(map, arg, :one), do: Map.get(map, arg)
   def lookup(map, arg, :list), do: Map.get(map, arg, [])
 
-  defp ambiguous_message(key, value) do
+  defp ambiguous_message(key, value) when is_atom(key) do
     """
     Flurry: batch function returned multiple records with #{inspect(key)}=#{inspect(value)}.
 
@@ -182,6 +200,16 @@ defmodule Flurry.Consumer do
     with `returns: :list`:
 
         @decorate batch(my_fn(#{key}), returns: :list)
+    """
+  end
+
+  defp ambiguous_message(_fn, value) do
+    """
+    Flurry: correlate function extracted the same key (#{inspect(value)}) from \
+    two different records in the batch.
+
+    If this function is expected to return many records per key, declare it \
+    with `returns: :list`.
     """
   end
 end
