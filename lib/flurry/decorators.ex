@@ -47,6 +47,11 @@ defmodule Flurry.Decorators do
     # the caller's arg name.
     correlate = Keyword.get(opts, :correlate, key)
     timeout = Keyword.get(opts, :timeout, 5_000)
+    # `batch_by` arrives as AST because it's a function expression
+    # (closure or capture) — it doesn't get evaluated by the decorator
+    # library, only stashed for `__before_compile__` to unquote into
+    # the generated entry point.
+    batch_by = Keyword.get(opts, :batch_by)
 
     # Data-driven validation: `for` walks the list once and raises on the
     # first invalid entry. Adding a new option is a one-liner here, and
@@ -59,12 +64,22 @@ defmodule Flurry.Decorators do
       {:in_transaction, in_transaction, &(&1 == nil or &1 in [:warn, :safe, :bypass]),
        "must be :warn, :safe, or :bypass"},
       {:correlate, correlate, &is_atom/1, "must be an atom (the record field name to correlate by)"},
-      {:timeout, timeout, &(is_integer(&1) and &1 > 0), "must be a positive integer (milliseconds)"}
+      {:timeout, timeout, &(is_integer(&1) and &1 > 0), "must be a positive integer (milliseconds)"},
+      {:batch_by, batch_by, &(&1 == nil or Flurry.Decorators.function_ast?(&1)),
+       "must be a function expression (e.g. `fn tuple -> ... end` or `&MyMod.fun/1`)"}
     ]
 
     for {name, value, valid?, desc} <- validators, not valid?.(value) do
       raise ArgumentError,
             "Flurry: invalid `#{inspect(name)}` option #{inspect(value)} — #{desc}"
+    end
+
+    if batch_by != nil and group_args == [] do
+      raise ArgumentError,
+            "Flurry: `:batch_by` on a single-arg decoration (batch(#{singular}(#{key}))) " <>
+              "is meaningless — single-arg decorations have nothing to normalize beyond " <>
+              "the batched argument itself. Either remove :batch_by, or add additional " <>
+              "arguments to the decorator signature."
     end
 
     Module.put_attribute(context.module, :flurry_batches, %{
@@ -78,7 +93,11 @@ defmodule Flurry.Decorators do
       batch_size: batch_size,
       on_failure: on_failure,
       in_transaction: in_transaction,
-      timeout: timeout
+      timeout: timeout,
+      # Stored as raw AST — `__before_compile__` unquotes it directly
+      # into the generated entry point, then strips this key from the
+      # batch map before it gets escaped into `__flurry_batches__/0`.
+      batch_by: batch_by
     })
   end
 
@@ -94,6 +113,14 @@ defmodule Flurry.Decorators do
     Got: #{Macro.to_string(other)}
     """
   end
+
+  @doc false
+  # Public only so the validator closures in `register/3` can call it
+  # (they can't reference module-local private functions from inside a
+  # closure captured in a local variable).
+  def function_ast?({:fn, _, _}), do: true
+  def function_ast?({:&, _, _}), do: true
+  def function_ast?(_), do: false
 
   defp arg_name!({name, _meta, ctx}, _singular) when is_atom(name) and is_atom(ctx), do: name
 

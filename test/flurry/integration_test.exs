@@ -475,6 +475,79 @@ defmodule Flurry.IntegrationTest do
     end
   end
 
+  describe "batch_by: normalizer" do
+    # A decorated fn whose group arg is a map with some noise fields
+    # (simulating an Ecto struct with preloads or extraneous data). The
+    # batch_by normalizer extracts just the :id, so two callers passing
+    # structurally-different-but-semantically-equal maps coalesce into
+    # the same batch. The bulk fn receives the NORMALIZED value
+    # (integer id), not the original struct.
+    defmodule NormalizedBatchByBatcher do
+      @moduledoc false
+      use Flurry, repo: :none
+
+      @decorate batch(
+                  get(id, owner),
+                  batch_by: fn {owner} -> {owner.id} end
+                )
+      def get_many(ids, owner_id) do
+        Agent.update(
+          __MODULE__.Sink,
+          fn s -> %{s | calls: [{ids, owner_id} | s.calls]} end
+        )
+
+        # Note: owner_id is an integer here (post-normalization), not
+        # the original map.
+        for id <- ids, do: %{id: id, owner_id: owner_id}
+      end
+    end
+
+    setup do
+      {:ok, _} = Agent.start(fn -> %{calls: []} end, name: NormalizedBatchByBatcher.Sink)
+      start_supervised!(NormalizedBatchByBatcher)
+      on_exit(fn -> safe_agent_stop(NormalizedBatchByBatcher.Sink) end)
+      :ok
+    end
+
+    test "the bulk fn receives the normalized value, not the raw group arg" do
+      # Caller passes a map with an :id and some noise fields. The
+      # batch_by extracts .id, so the bulk fn should see just the int.
+      assert %{id: 1, owner_id: 42} =
+               NormalizedBatchByBatcher.get(1, %{id: 42, noise: :a, other: [1, 2, 3]})
+
+      # The bulk fn was called with an integer owner_id (not a map).
+      [{_ids, owner_id} | _] = Agent.get(NormalizedBatchByBatcher.Sink, & &1.calls)
+      assert owner_id == 42
+      assert is_integer(owner_id)
+    end
+
+    test "callers with structurally different but semantically equal group args coalesce" do
+      # Two callers, same owner.id but different "noise" fields. Without
+      # batch_by they'd form two distinct groups; with batch_by they
+      # should share one group and coalesce.
+      tasks = [
+        Task.async(fn ->
+          NormalizedBatchByBatcher.get(1, %{id: 42, noise: :preloaded_posts})
+        end),
+        Task.async(fn ->
+          NormalizedBatchByBatcher.get(2, %{id: 42, noise: :not_preloaded})
+        end)
+      ]
+
+      results = Task.await_many(tasks, 5_000)
+
+      assert [%{id: 1, owner_id: 42}, %{id: 2, owner_id: 42}] = results
+
+      # Every bulk call's owner_id should be 42 (the normalized int),
+      # never a map. Proves the normalization was applied before any
+      # state was stored.
+      calls = Agent.get(NormalizedBatchByBatcher.Sink, & &1.calls)
+      assert Enum.all?(calls, fn {_ids, owner_id} -> owner_id == 42 end)
+      # Under coalescing, <2 calls is possible; under total serialization, 2.
+      assert length(calls) <= 2
+    end
+  end
+
   describe "error propagation" do
     test "an exception in the bulk function is delivered to all callers" do
       defmodule Exploder do

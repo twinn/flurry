@@ -146,56 +146,56 @@ defmodule Flurry do
 
     batches = Enum.reverse(batches)
 
+    # Pre-compute the two possible return-type specs once, outside the
+    # per-batch loop, so the loop can look them up without a branch.
+    return_types = %{
+      one: quote(do: term() | nil | {:error, Exception.t()}),
+      list: quote(do: [term()] | {:error, Exception.t()})
+    }
+
     singular_defs =
-      Enum.map(batches, fn batch ->
-        singular = batch.singular
+      for batch <- batches do
         batched_var = Macro.var(batch.key, nil)
         group_vars = Enum.map(batch.group_args, &Macro.var(&1, nil))
         all_vars = [batched_var | group_vars]
 
-        # Return-mode-aware spec for the generated singular entry point.
         spec_arg_types = List.duplicate(quote(do: term()), length(all_vars))
-
-        return_type =
-          case batch.returns do
-            :one -> quote(do: term() | nil | {:error, Exception.t()})
-            :list -> quote(do: [term()] | {:error, Exception.t()})
-          end
+        return_type = return_types[batch.returns]
 
         spec_ast =
           quote do
-            @spec unquote(singular)(unquote_splicing(spec_arg_types)) :: unquote(return_type)
+            @spec unquote(batch.singular)(unquote_splicing(spec_arg_types)) ::
+                    unquote(return_type)
           end
 
-        # The group key tuple AST: `{user_id, active?}` for group_vars
-        # `[user_id, active?]`; `{}` for single-arg decorations.
-        group_tuple_ast =
-          case group_vars do
-            [] -> quote(do: {})
-            _ -> {:{}, [], group_vars}
-          end
+        # {:{}, [], vars} is the AST for ANY-arity tuple and evaluates
+        # correctly for 0, 1, or 2+ elements — no need to case on empty.
+        raw_group_tuple_ast = {:{}, [], group_vars}
 
-        body_ast =
-          build_entry_body(
-            batch,
-            repo,
-            batched_var,
-            all_vars,
-            group_tuple_ast
-          )
+        # `batch_by: &1` when absent is a no-op identity function — the
+        # extra call site is negligible, and this collapses the nil/not
+        # branches into a single generated-code shape.
+        normalizer_ast = batch.batch_by || quote(do: & &1)
+        group_tuple_ast = quote(do: unquote(normalizer_ast).(unquote(raw_group_tuple_ast)))
+
+        body_ast = build_entry_body(batch, repo, batched_var, all_vars, group_tuple_ast)
 
         quote do
           unquote(spec_ast)
 
-          def unquote(singular)(unquote_splicing(all_vars)) do
+          def unquote(batch.singular)(unquote_splicing(all_vars)) do
             unquote(body_ast)
           end
         end
-      end)
+      end
+
+    # `:batch_by` is compile-time-only AST — strip it from the runtime
+    # batch maps so Macro.escape doesn't try to serialize it.
+    runtime_batches = Enum.map(batches, &Map.delete(&1, :batch_by))
 
     quote do
       @spec __flurry_batches__() :: [map()]
-      def __flurry_batches__, do: unquote(Macro.escape(batches))
+      def __flurry_batches__, do: unquote(Macro.escape(runtime_batches))
 
       @spec child_spec(keyword()) :: Supervisor.child_spec()
       def child_spec(opts) do

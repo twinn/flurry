@@ -231,6 +231,42 @@ defmodule FlurryTest do
         Code.eval_quoted(ast)
       end
     end
+
+    test ":batch_by on a single-arg decoration raises at compile time" do
+      # Single-arg decorations have no additional args to normalize, so
+      # batch_by is meaningless here.
+      ast =
+        quote do
+          defmodule BatchByOnSingleArg do
+            @moduledoc false
+            use Flurry, repo: :none
+
+            @decorate batch(get(id), batch_by: fn _ -> {} end)
+            def get_many(ids), do: ids
+          end
+        end
+
+      assert_raise ArgumentError, ~r/batch_by.*single-arg/, fn ->
+        Code.eval_quoted(ast)
+      end
+    end
+
+    test ":batch_by with a non-function value raises at compile time" do
+      ast =
+        quote do
+          defmodule BatchByNotFunction do
+            @moduledoc false
+            use Flurry, repo: :none
+
+            @decorate batch(get(id, user_id), batch_by: :not_a_function)
+            def get_many(ids, user_id), do: Enum.map(ids, &%{id: &1, user_id: user_id})
+          end
+        end
+
+      assert_raise ArgumentError, ~r/invalid `:batch_by`/, fn ->
+        Code.eval_quoted(ast)
+      end
+    end
   end
 
   describe "in_transaction default resolution" do

@@ -119,6 +119,55 @@ When more requests pile up than `batch_size` allows, Flurry flushes
 `batch_size` at a time across successive cycles, respecting the cap
 on every emission.
 
+### `batch_by:` — normalize what defines a batch
+
+For multi-arg decorations, the additional arguments beyond the
+batched variable determine which callers share a batch. By default
+those arguments are compared by Elixir's structural equality, which
+can be too strict when they contain noise that shouldn't affect
+batching — preloaded Ecto associations, extraneous metadata,
+timestamp fields, etc.
+
+`batch_by:` takes a 1-arity function that receives the raw tuple of
+the non-batched arguments and returns the canonical form used for
+both coalescing AND the bulk function's argument positions:
+
+```elixir
+@decorate batch(
+  get_post(slug, user),
+  batch_by: fn {user} -> {user.id} end
+)
+def get_many(slugs, user_id) do
+  # Note: user_id is an integer here, post-normalization.
+  Repo.all(from p in Post, where: p.slug in ^slugs and p.user_id == ^user_id)
+end
+
+# Call site stays ergonomic — pass the whole struct:
+MyApp.PostBatcher.get_post("hello", current_user)
+```
+
+Two callers passing structurally-different-but-semantically-equal
+structs (e.g. the same user with and without preloaded associations)
+will coalesce into the same batch, and the bulk function sees just
+the integer id — not the struct.
+
+**The trade-off worth knowing:** with `batch_by:`, the bulk function
+signature takes the *normalized* values, not the raw decorator arg
+types. The caller site passes a struct; the bulk function receives
+an integer. It's like a GraphQL resolver that works with parent
+object ids: ergonomic at the call site, efficient at the
+implementation. Document the normalized shape in the bulk function's
+@doc if you expect others to read it.
+
+Valid values:
+
+- Closures: `batch_by: fn {a, b} -> {a.id, b} end`
+- Captures: `batch_by: &MyApp.Utils.strip_preloads/1`
+
+Not supported: MFA tuples, atoms (use `correlate:` for field-name
+lookups), strings. `batch_by:` on a single-arg decoration raises at
+compile time (there are no additional arguments to normalize).
+
 ### `correlate: :field_name`
 
 By default, Flurry uses the first decorator argument's name as both the
@@ -229,12 +278,13 @@ Given `@decorate batch(get(id))`, Flurry:
 Missing records become `nil` in `:one` mode or `[]` in `:list`
 mode.
 
-## Multi-arg / group-keyed batching
+## Multi-arg batching
 
 If your decorated function takes more than one argument, the **first**
-argument is the batched variable and the **remaining** arguments form
-a *group key*. Callers sharing the same group key coalesce into the
-same bulk call; callers with different group keys run as independent
+argument is the batched variable and the **remaining** arguments
+select which callers share a batch. Callers whose non-batched
+arguments are structurally equal coalesce into the same bulk call;
+callers with different non-batched arguments run as independent
 batches.
 
 ```elixir
@@ -246,21 +296,24 @@ def get_many_posts(slugs, user_id, active?) do
   )
 end
 
-# These three calls produce THREE separate bulk invocations, one per
-# distinct (user_id, active?) tuple:
-GroupedBatcher.get_post("a", 1, true)   # group {1, true}
-GroupedBatcher.get_post("b", 1, true)   # group {1, true}  (coalesces with "a")
-GroupedBatcher.get_post("c", 2, true)   # group {2, true}  (own batch)
-GroupedBatcher.get_post("d", 1, false)  # group {1, false} (own batch)
+# These four calls produce THREE separate bulk invocations, one per
+# distinct (user_id, active?) combination:
+PostBatcher.get_post("a", 1, true)   # {1, true}
+PostBatcher.get_post("b", 1, true)   # {1, true}  (coalesces with "a")
+PostBatcher.get_post("c", 2, true)   # {2, true}  (own batch)
+PostBatcher.get_post("d", 1, false)  # {1, false} (own batch)
 ```
 
-Each group has its own pending list, its own `batch_size` cap, its
-own priority queue for bisect retries, and its own slot in the
-producer's LRU flush rotation (so no group can starve the others).
+Each distinct combination has its own pending list, its own
+`batch_size` cap, its own priority queue for bisect retries, and its
+own slot in the producer's LRU flush rotation so one combination
+can't starve the others.
 
 The decorator's first argument name is still the correlation field
 (`slug` in the example above — each returned record must have a
-`:slug` field matching the caller's request).
+`:slug` field matching the caller's request). To customize how the
+non-batched arguments are compared — e.g. to strip preloaded Ecto
+associations or ignore noise fields — see [`batch_by:`](#batch_by--normalize-what-defines-a-batch).
 
 ## Transactions
 
@@ -380,10 +433,13 @@ calling `enable_bypass_globally()` for that suite.
   record. Computed keys, MFA callbacks, and anonymous functions are
   not supported today — if you need them, transform your bulk
   function's output to expose a matchable field before returning.
-- **Group keys must be structurally comparable.** Tuples of atoms,
-  numbers, and binaries work. Maps and structs are compared
-  structurally by Elixir, which works but may surprise you with
-  order-insensitive equality.
+- **Additive argument merging isn't supported yet.** Arguments that
+  should be unioned across coalesced callers (the motivating case is
+  a `preloads:` list for Ecto queries — different callers may ask for
+  different preloads and the batch should load their union) are
+  tracked in [issue #1](https://github.com/twinn/flurry/issues/1).
+  For now, either pre-compute the union at the call site or use
+  distinct decorated functions per preload shape.
 
 ## License
 
