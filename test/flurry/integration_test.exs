@@ -424,6 +424,65 @@ defmodule Flurry.IntegrationTest do
     end
   end
 
+  describe "additive: merge args across coalesced callers" do
+    # Simulates the Ecto preloads case: callers supply different
+    # preload lists for the same underlying query, and `additive:`
+    # unions them across all entries in the batch so the bulk
+    # function loads the superset once.
+    defmodule PreloadBatcher do
+      @moduledoc false
+      use Flurry, repo: :none
+
+      @decorate batch(get(id, preloads), additive: [:preloads])
+      def get_many(ids, preloads) do
+        Agent.update(__MODULE__.Sink, fn s ->
+          %{s | calls: [{ids, preloads} | s.calls]}
+        end)
+
+        Enum.map(ids, &%{id: &1, loaded_preloads: preloads})
+      end
+    end
+
+    setup do
+      {:ok, _} = Agent.start(fn -> %{calls: []} end, name: PreloadBatcher.Sink)
+      start_supervised!(PreloadBatcher)
+      on_exit(fn -> safe_agent_stop(PreloadBatcher.Sink) end)
+      :ok
+    end
+
+    test "single caller sees their requested preloads" do
+      assert %{id: 1, loaded_preloads: [:posts]} = PreloadBatcher.get(1, [:posts])
+    end
+
+    test "concurrent callers with distinct preloads coalesce into one bulk call" do
+      tasks = [
+        Task.async(fn -> PreloadBatcher.get(1, [:posts]) end),
+        Task.async(fn -> PreloadBatcher.get(2, [:comments]) end),
+        Task.async(fn -> PreloadBatcher.get(3, [:posts, :profile]) end)
+      ]
+
+      results = Task.await_many(tasks, 5_000)
+
+      # Every caller gets a record back — whichever preloads the batch
+      # ultimately loaded (the union), each caller's result is correct
+      # because the correlation still matches id → record.
+      assert length(results) == 3
+      assert Enum.all?(results, &Map.has_key?(&1, :loaded_preloads))
+
+      calls = Agent.get(PreloadBatcher.Sink, & &1.calls)
+      # The additive merge should collapse all three callers into one
+      # bulk call (or at most two, under staggered arrival timing).
+      assert length(calls) <= 2
+
+      # The union of all bulk calls' preloads must contain everything
+      # that was requested.
+      all_loaded = calls |> Enum.flat_map(fn {_ids, preloads} -> preloads end) |> Enum.uniq()
+      assert :posts in all_loaded
+      assert :comments in all_loaded
+      assert :profile in all_loaded
+    end
+  end
+
   describe "correlate: function form" do
     # A decorated function whose bulk fn returns records keyed by a
     # nested value, not a top-level field. Function-form correlate lets

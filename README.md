@@ -172,6 +172,52 @@ Without `overridable:`, the generated function is a plain `def` — no
 `defoverridable`, no super, and attempting to redefine it in the
 module body is a compile error.
 
+### `additive:` — merge list-valued args across coalesced callers
+
+Some arguments aren't part of a batch's *identity* — different
+callers can specify different values and the batch should combine
+them. The archetypal case is Ecto preloads: one caller wants
+`[:posts]`, another wants `[:comments]`, the batch should load
+`[:posts, :comments]` and each caller gets a correctly-correlated
+record (with more preloaded than they asked for, which is harmless).
+
+```elixir
+@decorate batch(get(id, preloads), additive: [:preloads])
+def get_many(ids, preloads) do
+  Repo.all(from u in User, where: u.id in ^ids, preload: ^preloads)
+end
+
+# Three concurrent callers with distinct preloads:
+MyApp.UserBatcher.get(1, [:posts])
+MyApp.UserBatcher.get(2, [:comments])
+MyApp.UserBatcher.get(3, [:posts, :profile])
+
+# All three coalesce into one bulk call:
+# get_many([1, 2, 3], [:posts, :comments, :profile])
+```
+
+**How it works:**
+
+- Named args are **excluded from the producer's routing key**, so
+  callers who differ only on additive args still share a batch.
+- At flush time, the additive values across all entries in the batch
+  are merged (default: `list ++ list |> Enum.uniq/1`) and the bulk
+  function receives the merged value in the same argument position.
+- Non-additive args still bucket callers normally — additive-only
+  merging doesn't affect other dimensions.
+
+**Restrictions:**
+
+- Values at additive positions must be lists. Non-list values aren't
+  supported by the default merge.
+- `additive:` and [`batch_by:`](#batch_by--normalize-what-defines-a-batch)
+  cannot be combined on the same decoration — `batch_by:` can
+  reshape the group tuple, which breaks the position-based merging
+  `additive:` uses. Compile-time error.
+- Every name in `additive:` must appear in the decorator's group
+  args (everything after the first argument). Compile-time error
+  otherwise.
+
 ### `batch_by:` — normalize what defines a batch
 
 For multi-arg decorations, the additional arguments beyond the
@@ -513,13 +559,14 @@ calling `enable_bypass_globally()` for that suite.
   with a list of ids in hand who want to participate in batching
   currently have to call `get/1` per element via `Task.async_stream`.
   Tracked in [issue #2](https://github.com/twinn/flurry/issues/2).
-- **Additive argument merging isn't supported yet.** Arguments that
-  should be unioned across coalesced callers (the motivating case is
-  a `preloads:` list for Ecto queries — different callers may ask
-  for different preloads and the batch should load their union) are
-  tracked in [issue #1](https://github.com/twinn/flurry/issues/1).
-  For now, either pre-compute the union at the call site or use
-  distinct decorated functions per preload shape.
+- **Additive merging uses a fixed default merge function.** The
+  default is `list ++ list |> Enum.uniq/1`, which works for flat
+  lists of atoms (e.g. Ecto preloads as `[:posts, :comments]`) but
+  is wrong for nested preload trees like
+  `[posts: [:comments]] ++ [posts: [:author]]` (you get two
+  `:posts` keys instead of one merged subtree). A user-supplied
+  merge function per additive arg is tracked as a follow-up in
+  [issue #1](https://github.com/twinn/flurry/issues/1).
 
 ## License
 

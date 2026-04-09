@@ -46,11 +46,15 @@ defmodule Flurry.Producer do
   end
 
   @impl true
-  def handle_call({:enqueue, group_key, arg}, from, state) do
-    state = enqueue(state, group_key, arg, from)
+  def handle_call({:enqueue, group_tuple, arg}, from, state) do
+    # Split the group tuple into (routing_key, additive_values). For
+    # non-additive batches, additive_positions is [], routing_key equals
+    # the full tuple, and additive_values is []. The entry always stores
+    # the 3-tuple form {arg, additive_values, from} — at emission time
+    # we strip it back to {arg, from} for the event.
+    {routing_key, additive_values} = split_tuple(group_tuple, state.batch.additive_positions)
+    state = enqueue(state, routing_key, arg, additive_values, from)
     {events, state} = do_maybe_emit(state)
-    # We intentionally don't reply to `from` here — the consumer will reply
-    # once the batch runs. `:noreply` leaves the caller blocked.
     {:noreply, events, state}
   end
 
@@ -73,15 +77,15 @@ defmodule Flurry.Producer do
     {:noreply, events, state}
   end
 
-  defp enqueue(state, group_key, arg, from) do
-    existing = Map.get(state.pending, group_key, [])
-    new_list = existing ++ [{arg, from}]
-    new_pending = Map.put(state.pending, group_key, new_list)
+  defp enqueue(state, routing_key, arg, additive_values, from) do
+    existing = Map.get(state.pending, routing_key, [])
+    new_list = existing ++ [{arg, additive_values, from}]
+    new_pending = Map.put(state.pending, routing_key, new_list)
 
     new_group_order =
-      if Map.has_key?(state.pending, group_key),
+      if Map.has_key?(state.pending, routing_key),
         do: state.group_order,
-        else: state.group_order ++ [group_key]
+        else: state.group_order ++ [routing_key]
 
     %{state | pending: new_pending, group_order: new_group_order}
   end
@@ -136,21 +140,99 @@ defmodule Flurry.Producer do
     end)
   end
 
-  defp flush_group(state, group_key) do
-    entries = Map.get(state.pending, group_key, [])
+  defp flush_group(state, routing_key) do
+    entries = Map.get(state.pending, routing_key, [])
     {to_flush, remaining} = Enum.split(entries, state.batch_size)
 
-    event = {:flurry_batch, state.module, state.batch, group_key, to_flush}
+    additive_positions = state.batch.additive_positions
+    merged_additives = merge_additive_values(to_flush, length(additive_positions))
+    full_group_tuple = reconstruct_tuple(routing_key, merged_additives, additive_positions)
+
+    # Strip entries to the 2-tuple form the consumer expects in events.
+    stripped = Enum.map(to_flush, fn {arg, _additive, from} -> {arg, from} end)
+    event = {:flurry_batch, state.module, state.batch, full_group_tuple, stripped}
 
     {new_pending, new_group_order} =
       if remaining == [] do
-        {Map.delete(state.pending, group_key), List.delete(state.group_order, group_key)}
+        {Map.delete(state.pending, routing_key), List.delete(state.group_order, routing_key)}
       else
         # Rotate: move this group to the back of the LRU queue.
-        rotated = List.delete(state.group_order, group_key) ++ [group_key]
-        {Map.put(state.pending, group_key, remaining), rotated}
+        rotated = List.delete(state.group_order, routing_key) ++ [routing_key]
+        {Map.put(state.pending, routing_key, remaining), rotated}
       end
 
     {[event], %{state | pending: new_pending, group_order: new_group_order, demand: state.demand - 1}}
+  end
+
+  @doc """
+  Splits a group tuple into a routing-key tuple (non-additive values in
+  their original order) and a list of additive values (in the order of
+  `additive_positions`). For non-additive batches (`additive_positions == []`)
+  the routing key equals the input tuple and additive values is `[]`.
+  """
+  @spec split_tuple(tuple(), [non_neg_integer()]) :: {tuple(), [term()]}
+  def split_tuple(group_tuple, []), do: {group_tuple, []}
+
+  def split_tuple(group_tuple, additive_positions) do
+    positions_set = MapSet.new(additive_positions)
+
+    {routing, additive} =
+      group_tuple
+      |> Tuple.to_list()
+      |> Enum.with_index()
+      |> Enum.split_with(fn {_v, i} -> not MapSet.member?(positions_set, i) end)
+
+    routing_key = routing |> Enum.map(&elem(&1, 0)) |> List.to_tuple()
+
+    # Preserve the order of `additive_positions` in the returned list,
+    # not the order positions happen to appear in the tuple.
+    additive_by_position = Map.new(additive, fn {v, i} -> {i, v} end)
+    additive_values = Enum.map(additive_positions, &Map.fetch!(additive_by_position, &1))
+
+    {routing_key, additive_values}
+  end
+
+  @doc """
+  Merges additive values across a list of entries, position-by-position.
+  Each entry's additive_values is a list of the same length as the
+  caller's `additive_positions`. The default merge is list concatenation
+  followed by `Enum.uniq/1`.
+  """
+  @spec merge_additive_values([{term(), [term()], GenServer.from()}], non_neg_integer()) ::
+          [term()]
+  def merge_additive_values(_entries, 0), do: []
+
+  def merge_additive_values(entries, num_additive) do
+    for i <- 0..(num_additive - 1) do
+      entries
+      |> Enum.flat_map(fn {_arg, additive_values, _from} ->
+        Enum.at(additive_values, i) || []
+      end)
+      |> Enum.uniq()
+    end
+  end
+
+  @doc """
+  Reconstructs the full group tuple from a routing-key tuple and a list
+  of merged additive values, interleaving them back into the original
+  positions.
+  """
+  @spec reconstruct_tuple(tuple(), [term()], [non_neg_integer()]) :: tuple()
+  def reconstruct_tuple(routing_key, _merged, []), do: routing_key
+
+  def reconstruct_tuple(routing_key, merged_additives, additive_positions) do
+    total_arity = tuple_size(routing_key) + length(additive_positions)
+    additive_map = additive_positions |> Enum.zip(merged_additives) |> Map.new()
+    routing_list = Tuple.to_list(routing_key)
+
+    {full, _} =
+      Enum.reduce(0..(total_arity - 1), {[], routing_list}, fn pos, {acc, r_rem} ->
+        case Map.fetch(additive_map, pos) do
+          {:ok, value} -> {[value | acc], r_rem}
+          :error -> {[hd(r_rem) | acc], tl(r_rem)}
+        end
+      end)
+
+    full |> Enum.reverse() |> List.to_tuple()
   end
 end

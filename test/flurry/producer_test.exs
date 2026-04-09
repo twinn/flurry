@@ -15,7 +15,14 @@ defmodule Flurry.ProducerTest do
 
     %{
       module: FakeMod,
-      batch: %{singular: :get, key: :id, bulk: :get_many, returns: :one, arity: 1},
+      batch: %{
+        singular: :get,
+        key: :id,
+        bulk: :get_many,
+        returns: :one,
+        arity: 1,
+        additive_positions: Keyword.get(opts, :additive_positions, [])
+      },
       batch_size: Keyword.get(opts, :batch_size, 100),
       pending: pending_map,
       group_order: group_order,
@@ -28,7 +35,15 @@ defmodule Flurry.ProducerTest do
     state(%{@g => entries}, demand, opts)
   end
 
-  defp entry(id), do: {id, {self(), make_ref()}}
+  # Pending entries inside the producer carry a 3-tuple
+  # `{arg, additive_values, from}`. For non-additive batches
+  # additive_values is always `[]`.
+  defp entry(id), do: {id, [], {self(), make_ref()}}
+  defp entry(id, additive), do: {id, additive, {self(), make_ref()}}
+
+  # Priority items and emitted events carry the stripped 2-tuple
+  # `{arg, from}` — this is what downstream consumers see.
+  defp stripped_entry(id), do: {id, {self(), make_ref()}}
 
   describe "maybe_emit/2 — empty cases" do
     test "no pending → no events" do
@@ -101,7 +116,7 @@ defmodule Flurry.ProducerTest do
     # tagged with their group key so that requeues route back to the
     # correct group.
     test "with priority non-empty and demand > 0, flushes first priority batch as one event" do
-      priority_batch = Enum.map([1, 2, 3], &entry/1)
+      priority_batch = Enum.map([1, 2, 3], &stripped_entry/1)
       new_pending = [entry(99)]
 
       assert {[event], s} =
@@ -122,9 +137,9 @@ defmodule Flurry.ProducerTest do
     end
 
     test "multiple priority batches flush FIFO, one per call" do
-      b1 = Enum.map([1, 2], &entry/1)
-      b2 = Enum.map([3, 4], &entry/1)
-      b3 = Enum.map([5, 6], &entry/1)
+      b1 = Enum.map([1, 2], &stripped_entry/1)
+      b2 = Enum.map([3, 4], &stripped_entry/1)
+      b3 = Enum.map([5, 6], &stripped_entry/1)
 
       s0 = state(%{}, 1, priority: [{@g, b1}, {@g, b2}, {@g, b3}])
 
@@ -144,7 +159,7 @@ defmodule Flurry.ProducerTest do
     end
 
     test "with priority non-empty and demand == 0, holds" do
-      priority_batch = [entry(1)]
+      priority_batch = [stripped_entry(1)]
       assert {[], s} = Producer.maybe_emit(state(%{}, 0, priority: [{@g, priority_batch}]), 0)
       assert length(s.priority) == 1
     end
@@ -156,7 +171,7 @@ defmodule Flurry.ProducerTest do
     end
 
     test "priority flush does NOT mix with pending even if pending is non-empty" do
-      priority_batch = [entry(1)]
+      priority_batch = [stripped_entry(1)]
       pending = Enum.map([10, 11, 12], &entry/1)
 
       assert {[{:flurry_batch, _, _, @g, entries}], s} =
@@ -214,8 +229,13 @@ defmodule Flurry.ProducerTest do
           group_order: [@ga, @gb]
         )
 
-      # First flush: oldest group in group_order.
-      assert {[{:flurry_batch, _, _, @ga, [^entry_a]}], s1} = Producer.maybe_emit(s0, 0)
+      # First flush: oldest group in group_order. The event's entries
+      # are stripped to the 2-tuple `{arg, from}` form, so we match
+      # against that rather than the internal 3-tuple entry.
+      {arg_a, _additive_a, from_a} = entry_a
+      stripped_a = {arg_a, from_a}
+
+      assert {[{:flurry_batch, _, _, @ga, [^stripped_a]}], s1} = Producer.maybe_emit(s0, 0)
       # Group A's entry was flushed and the group is empty — drop it from pending AND group_order.
       refute Map.has_key?(s1.pending, @ga)
       refute @ga in s1.group_order
@@ -281,13 +301,83 @@ defmodule Flurry.ProducerTest do
     test "priority items are routed to their tagged group and don't cross-pollinate" do
       # Pending has work in gb, priority has a batch for ga.
       pending = %{@gb => Enum.map(1..3, &entry/1)}
-      priority_batch_a = Enum.map(100..102, &entry/1)
+      # Priority batches use the 2-tuple {arg, from} form that appears
+      # in events, not the 3-tuple pending-entry form.
+      priority_batch_a = Enum.map(100..102, &stripped_entry/1)
       s0 = state(pending, 1, group_order: [@gb], priority: [{@ga, priority_batch_a}])
 
       # Priority wins: emit ga's priority batch. gb pending untouched.
       assert {[{:flurry_batch, _, _, @ga, entries}], s1} = Producer.maybe_emit(s0, 0)
       assert Enum.map(entries, fn {a, _} -> a end) == [100, 101, 102]
       assert length(s1.pending[@gb]) == 3
+    end
+  end
+
+  describe "additive merging (pure helpers)" do
+    # Tests for the pure helpers that split a group tuple into routing
+    # + additive values, merge additive values across entries, and
+    # reconstruct the full tuple.
+
+    test "split_tuple/2 with no additive positions returns the tuple unchanged" do
+      assert {{1, true}, []} = Producer.split_tuple({1, true}, [])
+    end
+
+    test "split_tuple/2 removes additive positions into a separate list" do
+      # group args: [user_id, active?, preloads], additive positions: [2]
+      assert {{1, true}, [[:posts]]} = Producer.split_tuple({1, true, [:posts]}, [2])
+    end
+
+    test "split_tuple/2 handles multiple additive positions" do
+      # positions [0, 2] additive, position [1] routing
+      assert {{:middle}, [[:a], [:b]]} =
+               Producer.split_tuple({[:a], :middle, [:b]}, [0, 2])
+    end
+
+    test "merge_additive_values/2 returns [] when there are no additive positions" do
+      assert [] = Producer.merge_additive_values([entry(1)], 0)
+    end
+
+    test "merge_additive_values/2 unions list values at each additive position" do
+      entries = [
+        entry(1, [[:posts]]),
+        entry(2, [[:comments]]),
+        entry(3, [[:posts, :profile]])
+      ]
+
+      assert [merged] = Producer.merge_additive_values(entries, 1)
+      assert Enum.sort(merged) == [:comments, :posts, :profile]
+    end
+
+    test "merge_additive_values/2 merges multiple additive positions independently" do
+      entries = [
+        entry(1, [[:a], [:x]]),
+        entry(2, [[:b], [:y]]),
+        entry(3, [[:a, :c], [:y, :z]])
+      ]
+
+      assert [pos1, pos2] = Producer.merge_additive_values(entries, 2)
+      assert Enum.sort(pos1) == [:a, :b, :c]
+      assert Enum.sort(pos2) == [:x, :y, :z]
+    end
+
+    test "reconstruct_tuple/3 with no additive positions returns routing_key" do
+      assert {1, true} = Producer.reconstruct_tuple({1, true}, [], [])
+    end
+
+    test "reconstruct_tuple/3 interleaves merged additive values back into original positions" do
+      assert {1, true, [:posts]} =
+               Producer.reconstruct_tuple({1, true}, [[:posts]], [2])
+    end
+
+    test "reconstruct_tuple/3 handles additive positions in the middle and at the start" do
+      assert {[:x], :middle, [:y]} =
+               Producer.reconstruct_tuple({:middle}, [[:x], [:y]], [0, 2])
+    end
+
+    test "split_tuple/2 + reconstruct_tuple/3 round-trips a single-entry case" do
+      original = {1, :foo, [:posts]}
+      {routing, additives} = Producer.split_tuple(original, [2])
+      assert original == Producer.reconstruct_tuple(routing, additives, [2])
     end
   end
 end

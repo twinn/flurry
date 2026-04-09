@@ -52,6 +52,7 @@ defmodule Flurry.Decorators do
     # library, only stashed for `__before_compile__` to unquote into
     # the generated entry point.
     batch_by = Keyword.get(opts, :batch_by)
+    additive = Keyword.get(opts, :additive, [])
 
     # Data-driven validation: `for` walks the list once and raises on the
     # first invalid entry. Adding a new option is a one-liner here, and
@@ -75,13 +76,16 @@ defmodule Flurry.Decorators do
             "Flurry: invalid `#{inspect(name)}` option #{inspect(value)} — #{desc}"
     end
 
-    if batch_by != nil and group_args == [] do
-      raise ArgumentError,
-            "Flurry: `:batch_by` on a single-arg decoration (batch(#{singular}(#{key}))) " <>
-              "is meaningless — single-arg decorations have nothing to normalize beyond " <>
-              "the batched argument itself. Either remove :batch_by, or add additional " <>
-              "arguments to the decorator signature."
-    end
+    validate_group_shape_options!(%{
+      singular: singular,
+      key: key,
+      group_args: group_args,
+      batch_by: batch_by,
+      additive: additive
+    })
+
+    additive_positions =
+      Enum.map(additive, fn name -> Enum.find_index(group_args, &(&1 == name)) end)
 
     Module.put_attribute(context.module, :flurry_batches, %{
       singular: singular,
@@ -98,7 +102,8 @@ defmodule Flurry.Decorators do
       # Stored as raw AST — `__before_compile__` unquotes it directly
       # into the generated entry point, then strips this key from the
       # batch map before it gets escaped into `__flurry_batches__/0`.
-      batch_by: batch_by
+      batch_by: batch_by,
+      additive_positions: additive_positions
     })
   end
 
@@ -126,6 +131,45 @@ defmodule Flurry.Decorators do
   @doc false
   def valid_correlate?(c) when is_atom(c), do: true
   def valid_correlate?(c), do: function_ast?(c)
+
+  # Cross-field validation for options that interact with each other
+  # (batch_by/group_args/additive). Kept in one place because these
+  # checks are semantically a single "does this group-shape make
+  # sense?" unit — not a band-aid for complexity.
+  defp validate_group_shape_options!(%{
+         singular: singular,
+         key: key,
+         group_args: group_args,
+         batch_by: batch_by,
+         additive: additive
+       }) do
+    cond do
+      batch_by != nil and group_args == [] ->
+        raise ArgumentError,
+              "Flurry: `:batch_by` on a single-arg decoration (batch(#{singular}(#{key}))) " <>
+                "is meaningless — single-arg decorations have nothing to normalize beyond " <>
+                "the batched argument itself. Either remove :batch_by, or add additional " <>
+                "arguments to the decorator signature."
+
+      additive != [] and batch_by != nil ->
+        raise ArgumentError,
+              "Flurry: `:additive` and `:batch_by` cannot be combined on the same " <>
+                "decoration. `:batch_by` can change the shape of the group tuple, " <>
+                "which conflicts with `:additive`'s position-based merging. If you " <>
+                "need both, normalize your group args at the call site instead."
+
+      not Enum.all?(additive, &(&1 in group_args)) ->
+        bad = Enum.find(additive, &(&1 not in group_args))
+
+        raise ArgumentError,
+              "Flurry: `:additive` entry #{inspect(bad)} is not in the decorator's " <>
+                "group args #{inspect(group_args)}. Only arguments after the first " <>
+                "(batched) argument can be marked additive."
+
+      true ->
+        :ok
+    end
+  end
 
   defp arg_name!({name, _meta, ctx}, _singular) when is_atom(name) and is_atom(ctx), do: name
 

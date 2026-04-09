@@ -313,6 +313,62 @@ defmodule FlurryTest do
       end
     end
 
+    test ":additive with a name not in the decorator's group args raises" do
+      ast =
+        quote do
+          defmodule BadAdditiveName do
+            @moduledoc false
+            use Flurry, repo: :none
+
+            # `preloads` is NOT in the decorator signature
+            @decorate batch(get(id, user_id), additive: [:preloads])
+            def get_many(ids, user_id), do: Enum.map(ids, &%{id: &1, user_id: user_id})
+          end
+        end
+
+      assert_raise ArgumentError, ~r/:additive.*preloads.*not.*group args/, fn ->
+        Code.eval_quoted(ast)
+      end
+    end
+
+    test ":additive combined with :batch_by raises at compile time" do
+      ast =
+        quote do
+          defmodule AdditiveAndBatchBy do
+            @moduledoc false
+            use Flurry, repo: :none
+
+            @decorate batch(
+                        get(id, user_id, preloads),
+                        additive: [:preloads],
+                        batch_by: fn {user_id, preloads} -> {user_id, preloads} end
+                      )
+            def get_many(ids, user_id, preloads), do: Enum.map(ids, &%{id: &1, user_id: user_id, preloads: preloads})
+          end
+        end
+
+      assert_raise ArgumentError, ~r/:additive.*:batch_by.*cannot be combined/, fn ->
+        Code.eval_quoted(ast)
+      end
+    end
+
+    test ":additive on a single-arg decoration raises (no group args)" do
+      ast =
+        quote do
+          defmodule AdditiveOnSingleArg do
+            @moduledoc false
+            use Flurry, repo: :none
+
+            @decorate batch(get(id), additive: [:id])
+            def get_many(ids), do: Enum.map(ids, &%{id: &1})
+          end
+        end
+
+      assert_raise ArgumentError, ~r/:additive.*id.*not.*group args/, fn ->
+        Code.eval_quoted(ast)
+      end
+    end
+
     test ":batch_by with a non-function value raises at compile time" do
       ast =
         quote do
