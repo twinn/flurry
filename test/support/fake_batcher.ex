@@ -17,7 +17,7 @@ defmodule Flurry.Test.FakeBatcher do
   next batch.
   """
 
-  use Flurry
+  use Flurry, repo: :none
 
   @agent __MODULE__.State
 

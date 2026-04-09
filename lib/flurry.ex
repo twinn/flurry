@@ -97,18 +97,54 @@ defmodule Flurry do
   """
 
   @doc false
-  defmacro __using__(_opts) do
-    quote do
+  defmacro __using__(opts) do
+    repo =
+      case Keyword.fetch(opts, :repo) do
+        {:ok, value} ->
+          value
+
+        :error ->
+          raise ArgumentError, """
+          Flurry: `use Flurry` requires a `:repo` option.
+
+              use Flurry, repo: MyApp.Repo   # uses the repo's checked_out?/0
+                                             # to detect transactions
+              use Flurry, repo: :none        # no transaction semantics;
+                                             # always batches
+
+          The `:repo` option exists so that batched function calls made
+          from inside a `Repo.transaction/2` (or any context where a
+          connection has been checked out) can be detected and handled
+          per the `:in_transaction` decorator option. Pass `:none` only
+          if this module batches operations that have no database
+          context (e.g. external API calls).
+          """
+      end
+
+    quote bind_quoted: [repo: repo] do
       use Flurry.Decorators
 
       Module.register_attribute(__MODULE__, :flurry_batches, accumulate: true)
+      Module.put_attribute(__MODULE__, :flurry_repo, repo)
       @before_compile Flurry
     end
   end
 
   @doc false
   defmacro __before_compile__(env) do
-    batches = env.module |> Module.get_attribute(:flurry_batches) |> Enum.reverse()
+    repo = Module.get_attribute(env.module, :flurry_repo)
+    raw_batches = env.module |> Module.get_attribute(:flurry_batches) |> Enum.reverse()
+    batches = Enum.map(raw_batches, &resolve_in_transaction(&1, repo, env.module))
+
+    # Persist the resolved batches back so `__flurry_batches__/0` reflects
+    # the post-resolution view.
+    Module.delete_attribute(env.module, :flurry_batches)
+
+    Enum.each(batches, fn batch ->
+      Module.put_attribute(env.module, :flurry_batches, batch)
+    end)
+
+    batches = Enum.reverse(batches)
 
     singular_defs =
       Enum.map(batches, fn batch ->
@@ -118,9 +154,6 @@ defmodule Flurry do
         all_vars = [batched_var | group_vars]
 
         # Return-mode-aware spec for the generated singular entry point.
-        # We don't know the user's concrete types, so the best we can do
-        # is communicate the shape: scalar-or-nil-or-error for :one mode,
-        # list-or-error for :list mode. Every arg is typed as `term()`.
         spec_arg_types = List.duplicate(quote(do: term()), length(all_vars))
 
         return_type =
@@ -142,16 +175,20 @@ defmodule Flurry do
             _ -> {:{}, [], group_vars}
           end
 
+        body_ast =
+          build_entry_body(
+            batch,
+            repo,
+            batched_var,
+            all_vars,
+            group_tuple_ast
+          )
+
         quote do
           unquote(spec_ast)
 
           def unquote(singular)(unquote_splicing(all_vars)) do
-            Flurry.Runtime.call(
-              __MODULE__,
-              unquote(singular),
-              unquote(batched_var),
-              unquote(group_tuple_ast)
-            )
+            unquote(body_ast)
           end
         end
       end)
@@ -176,6 +213,107 @@ defmodule Flurry do
       end
 
       unquote_splicing(singular_defs)
+    end
+  end
+
+  # Fills in the default :in_transaction value based on the module's :repo
+  # setting, and validates illegal combinations.
+  defp resolve_in_transaction(batch, repo, module) do
+    default =
+      case repo do
+        :none -> :safe
+        _ -> :warn
+      end
+
+    resolved = batch.in_transaction || default
+
+    if repo == :none and resolved in [:warn, :bypass] do
+      raise ArgumentError, """
+      Flurry: #{inspect(module)}.#{batch.bulk}/#{batch.arity} has \
+      `in_transaction: #{inspect(resolved)}`, but this module is configured \
+      with `repo: :none`. `:in_transaction` modes other than `:safe` \
+      require a real `:repo` module so Flurry can call `checked_out?/0` \
+      on it.
+
+      Either:
+        1. Set a real repo on `use Flurry`, or
+        2. Use `in_transaction: :safe` on this decorator (or omit it — \
+      `:safe` is the default when `repo: :none`).
+      """
+    end
+
+    %{batch | in_transaction: resolved}
+  end
+
+  # Emits the entry-point body for a decorated function, varying by
+  # in_transaction mode. Every mode short-circuits to inline execution
+  # when `Flurry.Testing.bypass?()` is true.
+  defp build_entry_body(batch, repo, batched_var, all_vars, group_tuple_ast) do
+    singular = batch.singular
+
+    runtime_call_ast =
+      quote do
+        Flurry.Runtime.call(
+          __MODULE__,
+          unquote(singular),
+          unquote(batched_var),
+          unquote(group_tuple_ast)
+        )
+      end
+
+    inline_ast = build_inline_body(batch, batched_var, all_vars)
+
+    case batch.in_transaction do
+      :safe ->
+        quote do
+          if Flurry.Testing.bypass?() do
+            unquote(inline_ast)
+          else
+            unquote(runtime_call_ast)
+          end
+        end
+
+      :warn ->
+        quote do
+          if Flurry.Testing.bypass?() do
+            unquote(inline_ast)
+          else
+            Flurry.Runtime.maybe_warn_in_transaction(
+              __MODULE__,
+              unquote(singular),
+              unquote(repo)
+            )
+
+            unquote(runtime_call_ast)
+          end
+        end
+
+      :bypass ->
+        quote do
+          if Flurry.Testing.bypass?() or unquote(repo).checked_out?() do
+            unquote(inline_ast)
+          else
+            unquote(runtime_call_ast)
+          end
+        end
+    end
+  end
+
+  # Inline execution: run the bulk function in the caller's process with
+  # a singleton list and correlate the result. Used by test bypass and
+  # by `:bypass` mode when inside a transaction.
+  defp build_inline_body(batch, batched_var, all_vars) do
+    bulk = batch.bulk
+    key = batch.key
+    returns = batch.returns
+    group_vars = tl(all_vars)
+
+    bulk_call_args = [quote(do: [unquote(batched_var)]) | group_vars]
+
+    quote do
+      result = apply(__MODULE__, unquote(bulk), unquote(bulk_call_args))
+      correlated = Flurry.Consumer.correlate(result, unquote(key), unquote(returns))
+      Flurry.Consumer.lookup(correlated, unquote(batched_var), unquote(returns))
     end
   end
 end

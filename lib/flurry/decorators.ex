@@ -37,6 +37,11 @@ defmodule Flurry.Decorators do
     returns = Keyword.get(opts, :returns, :one)
     batch_size = Keyword.get(opts, :batch_size)
     on_failure = Keyword.get(opts, :on_failure, :bisect)
+    # `in_transaction` default is resolved at __before_compile__ time,
+    # because the default depends on the module-level :repo option which
+    # the decorator can't see. Store nil here and let before_compile fill
+    # it in based on the repo.
+    in_transaction = Keyword.get(opts, :in_transaction)
 
     if returns not in [:one, :list] do
       raise ArgumentError,
@@ -53,6 +58,11 @@ defmodule Flurry.Decorators do
             "Flurry: invalid `:on_failure` option #{inspect(on_failure)} — must be :fail_all or :bisect"
     end
 
+    if in_transaction != nil and in_transaction not in [:warn, :safe, :bypass] do
+      raise ArgumentError,
+            "Flurry: invalid `:in_transaction` option #{inspect(in_transaction)} — must be :warn, :safe, or :bypass"
+    end
+
     Module.put_attribute(context.module, :flurry_batches, %{
       singular: singular,
       key: key,
@@ -61,7 +71,8 @@ defmodule Flurry.Decorators do
       arity: context.arity,
       returns: returns,
       batch_size: batch_size,
-      on_failure: on_failure
+      on_failure: on_failure,
+      in_transaction: in_transaction
     })
   end
 

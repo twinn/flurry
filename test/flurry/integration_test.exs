@@ -105,7 +105,7 @@ defmodule Flurry.IntegrationTest do
     # shared FakeBatcher state.
     defmodule CappedBatcher do
       @moduledoc false
-      use Flurry
+      use Flurry, repo: :none
 
       @decorate batch(get(id))
       def get_many(ids) do
@@ -145,7 +145,7 @@ defmodule Flurry.IntegrationTest do
   describe "per-decorated-function batch_size" do
     defmodule MixedCapsBatcher do
       @moduledoc false
-      use Flurry
+      use Flurry, repo: :none
 
       # Decorator-level override wins over start_link's default.
       @decorate batch(get_small(id), batch_size: 2)
@@ -214,7 +214,7 @@ defmodule Flurry.IntegrationTest do
     # batches.
     defmodule GroupedBatcher do
       @moduledoc false
-      use Flurry
+      use Flurry, repo: :none
 
       @decorate batch(get_post(slug, user_id, active?))
       def get_many_posts(slugs, user_id, active?) do
@@ -316,7 +316,7 @@ defmodule Flurry.IntegrationTest do
     # caller in the same batch still gets their record.
     defmodule BisectBatcher do
       @moduledoc false
-      use Flurry
+      use Flurry, repo: :none
 
       @decorate batch(get(id), on_failure: :bisect)
       def get_many(ids) do
@@ -389,7 +389,7 @@ defmodule Flurry.IntegrationTest do
 
     defmodule ExitingBatcher do
       @moduledoc false
-      use Flurry
+      use Flurry, repo: :none
 
       @decorate batch(get(id), on_failure: :bisect)
       def get_many(ids) do
@@ -428,7 +428,7 @@ defmodule Flurry.IntegrationTest do
     test "an exception in the bulk function is delivered to all callers" do
       defmodule Exploder do
         @moduledoc false
-        use Flurry
+        use Flurry, repo: :none
 
         @decorate batch(get(id))
         def get_many(_ids), do: raise("boom")

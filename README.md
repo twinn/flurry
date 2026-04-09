@@ -44,7 +44,7 @@ end
 
 ```elixir
 defmodule MyApp.UserBatcher do
-  use Flurry
+  use Flurry, repo: MyApp.Repo
 
   @decorate batch(get(id))
   def get_many(ids) do
@@ -56,6 +56,11 @@ end
 `@decorate batch(get(id))` tells Flurry to generate a `get/1` entry
 point whose single argument is `id`, and to correlate the returned
 records back to callers by matching each record's `:id` field.
+
+The `repo:` option is **mandatory** — it's the module Flurry calls
+`checked_out?/0` on to detect transactional contexts. Pass `:none`
+for batchers that have no database involvement (e.g. external API
+coalescing). See [Transactions](#transactions) below for details.
 
 ### Start the batcher
 
@@ -216,6 +221,116 @@ producer's LRU flush rotation (so no group can starve the others).
 The decorator's first argument name is still the correlation field
 (`slug` in the example above — each returned record must have a
 `:slug` field matching the caller's request).
+
+## Transactions
+
+Flurry's bulk function runs in a background consumer process, not in
+the caller's process. That has two concrete consequences for database
+transactions that every user should understand — and the first one is
+much more dangerous than the second.
+
+1. **Writes made by the bulk function do NOT participate in the
+   caller's transaction.** Because the consumer uses a different DB
+   connection, any inserts/updates/deletes the bulk function performs
+   are committed on the consumer's connection independently of the
+   caller's transaction. If the caller's transaction later rolls
+   back, those writes are **not rolled back** — committed state
+   survives a "failed" transaction. This is a data integrity issue
+   for any **mutation batcher** (insert, update, delete) and must be
+   addressed by using `in_transaction: :bypass` on the decorator.
+2. **Reads made by the bulk function do NOT see the caller's
+   uncommitted writes.** If the caller has updated a row inside the
+   transaction and then calls a batched read, the read will see the
+   pre-update (committed) state, not the caller's in-progress update.
+   This is a consistency issue (read-your-writes), less severe than
+   the rollback problem but still worth knowing about. It usually
+   doesn't matter for read batchers called before any writes in the
+   same transaction.
+3. **Under `Ecto.Adapters.SQL.Sandbox` in tests**, the sandbox routes
+   queries by walking the calling process's `$callers`/`$ancestors`
+   ancestry to find the test that checked out a connection. The
+   consumer has no ancestry link to any test, so its queries hit
+   ownership errors under `:manual` mode.
+
+Flurry handles all three via the mandatory `repo:` option and a
+per-decorator `in_transaction:` setting.
+
+### `use Flurry, repo: ...` is mandatory
+
+```elixir
+use Flurry, repo: MyApp.Repo   # standard — uses Repo.checked_out?/0
+use Flurry, repo: :none        # no DB involvement, skip transaction handling
+```
+
+Omitting `:repo` is a compile-time error. The explicit choice forces
+you to think about transaction semantics instead of finding out in
+production.
+
+### `in_transaction: :warn | :safe | :bypass`
+
+Three modes, set per decorator. With a real repo the default is
+`:warn`; with `repo: :none` the default is `:safe` (and `:warn` /
+`:bypass` are compile errors).
+
+```elixir
+# Default — warns at runtime if called inside a transaction, still batches
+@decorate batch(get(id))
+def get_many(ids), do: Repo.all(from u in User, where: u.id in ^ids)
+
+# "I've reviewed this, batching inside transactions is fine" — no warning
+@decorate batch(get(id), in_transaction: :safe)
+def get_many(ids), do: Repo.all(from u in User, where: u.id in ^ids)
+
+# Bypass — inside a transaction, runs the bulk fn inline in the caller's
+# process so it participates in the transaction / rollback semantics.
+# Outside a transaction, batches normally.
+@decorate batch(insert(attrs), in_transaction: :bypass)
+def insert_many(attrs_list), do: Repo.insert_all(User, attrs_list, returning: true)
+```
+
+**When to use each:**
+
+- **`:bypass`** — **mandatory for any batcher that writes.** When
+  called inside a transaction, Flurry skips the pipeline and runs
+  the bulk function inline in the caller's process, so writes
+  execute on the caller's connection and participate in the
+  transaction's commit/rollback. Outside a transaction, batches
+  normally. This is the only mode that is safe for mutation
+  batchers. You lose batching for transactional calls, but you keep
+  atomicity — which is why you chose to be in a transaction.
+- **`:warn`** (default) — the driving signal is *"you didn't think
+  about this; think about it now."* Every call logs a warning if
+  `Repo.checked_out?/0` returns true. If this is a write batcher,
+  the warning is telling you to switch to `:bypass`. If it's a read
+  batcher and you've confirmed it doesn't need read-your-writes,
+  switch to `:safe`.
+- **`:safe`** — you've confirmed the batched call is a read that
+  doesn't need read-your-writes consistency with any preceding
+  writes in the same transaction. Typical for read batchers called
+  early in a transaction body, or for reads of data the current
+  transaction isn't mutating. **Never use `:safe` for a batcher
+  that writes to the database** — your writes will escape the
+  transaction and won't roll back.
+
+### Tests with Ecto SQL Sandbox
+
+Enable global bypass in your `test_helper.exs`:
+
+```elixir
+ExUnit.start()
+Flurry.Testing.enable_bypass_globally()
+```
+
+With bypass enabled, every call to a decorated function runs the bulk
+function inline in the caller's process — which, under the sandbox,
+has ancestry back to the test and a properly checked-out connection.
+`async: true` works out of the box.
+
+The tradeoff: the batching pipeline itself isn't exercised in your
+unit tests. The bulk function's own logic is still fully tested (it
+runs with a singleton list), but producer/consumer behavior is not.
+If you want integration tests of the pipeline, write them without
+calling `enable_bypass_globally()` for that suite.
 
 ## Limitations
 
