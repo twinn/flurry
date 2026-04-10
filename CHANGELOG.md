@@ -13,9 +13,11 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   list-out) implementation; Flurry generates the single-item entry point
   that enqueues, blocks, and replies with the correlated result.
 - GenStage-based producer/consumer pair per decorated function.
-- Opportunistic mailbox-peek flushing: batches are emitted when either
-  `batch_size` is reached or the producer's mailbox is empty. No timer-based
-  flushing.
+- Flush policy: batches are emitted when `batch_size` is reached, the
+  producer's mailbox is empty, or `max_wait` milliseconds have elapsed
+  since the first pending request.
+- `max_wait:` option (default 200ms) to cap worst-case flush latency under
+  slow trickle conditions.
 - Automatic input deduplication and key-based result correlation.
 - Scalar (`returns: :one`, default) and grouped (`returns: :list`) return
   modes. Scalar mode raises `Flurry.AmbiguousBatchError` when the bulk

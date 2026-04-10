@@ -51,8 +51,7 @@ defmodule Flurry.MixProject do
   defp description do
     "Scatter-gather batching for Elixir built on GenStage. " <>
       "Individual requests are coalesced into a single bulk call and " <>
-      "results are correlated back to each caller. Uses mailbox-peek " <>
-      "flushing instead of timers."
+      "results are correlated back to each caller."
   end
 
   defp package do
