@@ -1,12 +1,16 @@
 defmodule Flurry do
   @moduledoc """
-  Scatter-gather batching for Elixir. A flurry of individual requests
-  coalesces into a single bulk call, then disperses back to the callers.
+  Scatter-gather batching for Elixir, built on GenStage.
+
+  Individual requests are coalesced into a single bulk call and the results
+  are correlated back to each caller. The user defines a bulk (list-in,
+  list-out) function and decorates it; Flurry generates the single-item
+  entry point.
 
   ## Usage
 
       defmodule MyApp.UserBatcher do
-        use Flurry
+        use Flurry, repo: MyApp.Repo
 
         @decorate batch(get(id))
         def get_many(ids) do
@@ -14,59 +18,57 @@ defmodule Flurry do
         end
       end
 
-  The decorator generates `MyApp.UserBatcher.get/1` for you. Callers do:
+  The decorator generates `MyApp.UserBatcher.get/1`. Callers invoke:
 
       MyApp.UserBatcher.get(42)
       #=> %User{id: 42, ...}
 
-  Under the hood, `get/1` enqueues the request into a GenStage producer.
-  A consumer pulls a batch, invokes your `get_many/1` with a de-duplicated
-  list of ids, correlates the returned records back to each caller by the
-  `:id` field, and replies.
+  Internally, `get/1` enqueues the request into a GenStage producer. A
+  consumer pulls a batch, invokes `get_many/1` with a deduplicated list of
+  ids, correlates the returned records back to each caller by the `:id`
+  field, and replies.
 
-  ## Flush policy
+  ## Flush Policy
 
-  Flurry does not use a flush timer. A batch is emitted when either:
+  A batch is emitted when any of the following conditions is met:
 
     * `batch_size` (default 100) pending requests have accumulated, or
-    * the producer's mailbox is empty — i.e. there are no further requests
-      waiting to be enqueued *right now*.
+    * the producer's mailbox is empty, meaning no further requests are
+      waiting to be enqueued, or
+    * `max_wait` milliseconds (default 200) have elapsed since the first
+      pending request was enqueued.
 
-  This gives maximum batching under bursts and minimum latency under slow
-  load: singleton requests that arrive to an empty producer flush
-  immediately.
+  The mailbox-empty check provides minimum latency under low load: a single
+  request arriving at an idle producer flushes immediately. The `max_wait`
+  timer caps worst-case latency under slow trickle conditions where requests
+  arrive one at a time, fast enough to keep the mailbox non-empty but too
+  slowly to reach `batch_size`.
 
-  ## Error handling
+  ## Error Handling
 
-  The default `:on_failure` strategy is `:bisect`: if the bulk function
-  raises or exits for a batch of N entries, Flurry splits the batch in
-  half and retries each half as its own event. Splits recurse until a
-  singleton failure isolates the bad entry, whose caller receives an
-  error. Every other caller in the original batch still gets their
-  correlated record.
+  The default `:on_failure` strategy is `:bisect`. When the bulk function
+  raises or exits for a batch of N entries, Flurry splits the batch in half
+  and retries each half. Splits recurse until a singleton failure isolates
+  the problematic entry, whose caller receives an error. Every other caller
+  in the original batch receives their correlated record.
 
   The alternative is `on_failure: :fail_all`, where a single failure
-  delivers the error to every caller in the batch and no retry is
-  attempted.
+  delivers the error to every caller in the batch without retrying.
 
-  > **Idempotency warning.** `:bisect` re-invokes your bulk function with
-  > smaller subsets of the same inputs. If your bulk function has
-  > non-idempotent side effects — e.g. `Repo.insert_all/3` where some
-  > rows may have been inserted before the failure — **use
-  > `on_failure: :fail_all`** to avoid double-writes. Bisect is only safe
-  > for reads and other idempotent operations.
+  > `:bisect` re-invokes the bulk function with smaller subsets of the same
+  > inputs. If the bulk function has non-idempotent side effects, use
+  > `on_failure: :fail_all` to avoid double-writes. Bisect is safe only for
+  > reads and other idempotent operations.
 
   Raised exceptions pass through to callers as `{:error, exception}`,
-  preserving their original type so you can match on `Postgrex.Error`,
-  `Ecto.Query.CastError`, etc. Exits are wrapped in
-  `Flurry.BulkCallFailed` so callers see a uniform struct.
+  preserving their original type for pattern matching. Exits are wrapped in
+  `Flurry.BulkCallFailed`.
 
-  ## Return modes
+  ## Return Modes
 
-  The default is `returns: :one` — each caller's argument is expected to
-  match at most one record, keyed by the argument's name. If your bulk
-  function can legitimately return multiple records per caller, declare it
-  with `returns: :list`:
+  The default is `returns: :one`, where each caller's argument corresponds
+  to at most one record. Use `returns: :list` when the bulk function
+  returns multiple records per key:
 
       @decorate batch(get_posts_by_user(user_id), returns: :list)
       def get_posts_for_users(user_ids) do
@@ -74,15 +76,12 @@ defmodule Flurry do
       end
 
   In `:list` mode, `get_posts_by_user/1` returns a list of records per
-  caller (possibly empty).
+  caller (possibly empty). Using `returns: :one` on a function that returns
+  duplicate keys raises `Flurry.AmbiguousBatchError`.
 
-  Using `returns: :one` on a function that returns duplicate keys raises
-  `Flurry.AmbiguousBatchError` with a clear message pointing at the fix.
+  ## Starting the Batcher
 
-  ## Starting the batcher
-
-  `use Flurry` generates `start_link/1` and `child_spec/1` on your module,
-  so you add it to your supervision tree the normal way:
+  `use Flurry` generates `start_link/1` and `child_spec/1` on the module:
 
       children = [
         MyApp.UserBatcher
@@ -90,10 +89,13 @@ defmodule Flurry do
 
   ## Options
 
-  Pass options through `child_spec` / `start_link`:
+  Options are passed through `child_spec/1` or `start_link/1`:
 
-    * `:batch_size` — maximum number of requests in a single bulk call
+    * `:batch_size` - maximum number of requests in a single bulk call
       (default `100`).
+    * `:max_wait` - maximum time in milliseconds that the first pending
+      request waits before the producer forces a flush (default `200`).
+      Set to `nil` to disable the timer.
   """
 
   @doc false

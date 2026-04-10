@@ -1,34 +1,16 @@
 # Flurry
 
 [![CI](https://github.com/twinn/flurry/actions/workflows/ci.yml/badge.svg)](https://github.com/twinn/flurry/actions/workflows/ci.yml)
+[![Hex.pm](https://img.shields.io/hexpm/v/flurry.svg)](https://hex.pm/packages/flurry)
+[![Docs](https://img.shields.io/badge/docs-hexdocs-blue.svg)](https://hexdocs.pm/flurry)
 
-Scatter-gather batching for Elixir. A flurry of individual requests
-coalesces into a single bulk call, then disperses back to the callers.
-
-You write the plural function — one query, many ids — and decorate it.
-Flurry generates the singular entry point, runs a GenStage pipeline
-underneath, and correlates each caller's request with its result.
-
-## Why
-
-The classic N+1 problem: fifty LiveView mounts each call
-`Users.get(user_id)` in the same instant, each firing its own
-`SELECT * FROM users WHERE id = ?`. You wanted one query with
-`WHERE id IN (?, ?, ..., ?)` instead. Flurry batches the fifty calls
-into a single bulk query without the caller sites having to know.
-
-Unlike most batching libraries, Flurry **has no flush timer**. Batches
-are emitted when either:
-
-  * `batch_size` pending requests have accumulated, or
-  * the producer's mailbox is empty — i.e. there are no further
-    requests immediately queued.
-
-This gives maximum coalescing under bursts and minimum latency under
-slow load: a singleton request arriving to an idle producer flushes
-immediately as a batch of one.
+Scatter-gather batching for Elixir, built on GenStage. Individual requests
+are coalesced into a single bulk call and the results are correlated back
+to each caller.
 
 ## Installation
+
+Add `:flurry` to your list of dependencies in `mix.exs`:
 
 ```elixir
 def deps do
@@ -38,9 +20,12 @@ def deps do
 end
 ```
 
-## Usage
+## Overview
 
-### Declare a batched function
+A module that `use`s `Flurry` defines a bulk (list-in, list-out) function
+and decorates it with `@decorate batch(...)`. Flurry generates a
+single-item entry point, runs a GenStage producer/consumer pipeline, and
+correlates each caller's request with its result.
 
 ```elixir
 defmodule MyApp.UserBatcher do
@@ -53,19 +38,37 @@ defmodule MyApp.UserBatcher do
 end
 ```
 
-`@decorate batch(get(id))` tells Flurry to generate a `get/1` entry
-point whose single argument is `id`, and to correlate the returned
-records back to callers by matching each record's `:id` field.
+The decorator generates `MyApp.UserBatcher.get/1`. Under concurrency,
+N simultaneous calls collapse into one `get_many/1` invocation:
 
-The `repo:` option is **mandatory** — it's the module Flurry calls
-`checked_out?/0` on to detect transactional contexts. Pass `:none`
-for batchers that have no database involvement (e.g. external API
-coalescing). See [Transactions](#transactions) below for details.
+```elixir
+MyApp.UserBatcher.get(42)
+#=> %User{id: 42, ...}
 
-### Start the batcher
+MyApp.UserBatcher.get(999)
+#=> nil
+```
 
-`use Flurry` generates `start_link/1` and `child_spec/1` on your
-module. Add it to your supervision tree:
+## Flush Policy
+
+A batch is emitted when any of the following conditions is met:
+
+  * `batch_size` pending requests have accumulated, or
+  * the producer's mailbox is empty, meaning no further requests are
+    immediately queued, or
+  * `max_wait` milliseconds have elapsed since the first pending request
+    was enqueued.
+
+The mailbox-empty check provides minimum latency under low load: a single
+request arriving at an idle producer flushes immediately as a batch of one.
+The `max_wait` timer (default 200ms) caps worst-case latency under slow
+trickle conditions where requests arrive one at a time, fast enough to keep
+the mailbox non-empty but too slowly to reach `batch_size`.
+
+## Starting the Batcher
+
+`use Flurry` generates `start_link/1` and `child_spec/1` on the module.
+Add it to a supervision tree:
 
 ```elixir
 children = [
@@ -74,34 +77,12 @@ children = [
 ]
 ```
 
-### Call it
-
-```elixir
-MyApp.UserBatcher.get(42)
-#=> %User{id: 42, ...}
-
-MyApp.UserBatcher.get(999)
-#=> nil   # missing id
-```
-
-Under concurrency, N simultaneous calls collapse into one `get_many/1`
-invocation:
-
-```elixir
-for id <- 1..50 do
-  Task.async(fn -> MyApp.UserBatcher.get(id) end)
-end
-|> Enum.map(&Task.await/1)
-# one bulk query, 50 records returned, 50 callers replied to.
-```
-
 ## Options
 
 ### `batch_size`
 
-Cap the size of any single bulk call. Necessary because PostgreSQL
-and other databases have token/parameter limits on `WHERE id IN (?)`
-queries.
+Caps the size of any single bulk call. This is necessary because databases
+such as PostgreSQL impose parameter limits on `WHERE id IN (...)` queries.
 
 ```elixir
 # Module-wide default
@@ -111,21 +92,33 @@ children = [{MyApp.UserBatcher, batch_size: 500}]
 @decorate batch(get(id), batch_size: 500)
 def get_many(ids), do: ...
 
-@decorate batch(get_with_posts(id), batch_size: 50)  # heavier rows
+@decorate batch(get_with_posts(id), batch_size: 50)
 def get_many_with_posts(ids), do: ...
 ```
 
-When more requests pile up than `batch_size` allows, Flurry flushes
-`batch_size` at a time across successive cycles, respecting the cap
-on every emission.
+When more requests accumulate than `batch_size` allows, Flurry flushes
+`batch_size` entries at a time across successive cycles.
 
-### `overridable:` on `use Flurry` — wrap the generated function with `super/1`
+### `max_wait:`
 
-By default, the generated singular entry point (`get/1` in the
-examples above) isn't overridable — writing your own `def get/1` in
-the same module produces a redefinition error. When you want to wrap
-the generated function with extra logic, declare the name + arity on
-`use Flurry`:
+Maximum time in milliseconds that the first pending request waits before
+the producer forces a flush. Defaults to `200`. Set to `nil` to disable.
+
+```elixir
+# Module-wide default
+children = [{MyApp.UserBatcher, max_wait: 500}]
+
+# Per-decorated-function override
+@decorate batch(get(id), max_wait: 100)
+def get_many(ids), do: ...
+```
+
+### `overridable:`
+
+By default, the generated singular entry point is not overridable. Defining
+a function with the same name and arity in the module produces a
+redefinition error. The `overridable:` option on `use Flurry` allows
+wrapping the generated function via `super/1`:
 
 ```elixir
 defmodule MyApp.UserBatcher do
@@ -136,8 +129,6 @@ defmodule MyApp.UserBatcher do
     Repo.all(from u in User, where: u.id in ^ids)
   end
 
-  # Overrides the generated `get/1`. `super(id)` invokes the batched
-  # implementation.
   def get(id) do
     case super(id) do
       nil -> nil
@@ -147,39 +138,15 @@ defmodule MyApp.UserBatcher do
 end
 ```
 
-`overridable:` takes a keyword list of `name: arity` pairs. For each
-entry, Flurry injects a delegate + `defoverridable` at the top of
-your module *before* your function body is parsed — that's what lets
-your subsequent `def get/1` become a legitimate override and reach
-the batched implementation via `super/1`.
+The option accepts a keyword list of `name: arity` pairs. At compile time,
+Flurry validates that every `:overridable` entry has a matching
+`@decorate batch(...)` decoration with the same arity.
 
-At compile time, Flurry validates that every `:overridable` entry has
-a matching `@decorate batch(...)` decoration with the same arity.
-Both of these raise `CompileError`:
+### `additive:`
 
-```elixir
-# No matching decoration:
-use Flurry, repo: :none, overridable: [get_by_email: 1]
-# (no @decorate batch(get_by_email(...)))
-
-# Arity mismatch:
-use Flurry, repo: :none, overridable: [get: 1]
-@decorate batch(get(id, user_id))   # decorator declares arity 2
-def get_many(ids, user_id), do: ...
-```
-
-Without `overridable:`, the generated function is a plain `def` — no
-`defoverridable`, no super, and attempting to redefine it in the
-module body is a compile error.
-
-### `additive:` — merge list-valued args across coalesced callers
-
-Some arguments aren't part of a batch's *identity* — different
-callers can specify different values and the batch should combine
-them. The archetypal case is Ecto preloads: one caller wants
-`[:posts]`, another wants `[:comments]`, the batch should load
-`[:posts, :comments]` and each caller gets a correctly-correlated
-record (with more preloaded than they asked for, which is harmless).
+Merges list-valued arguments across coalesced callers. This is useful when
+different callers specify different values that the batch should combine,
+such as Ecto preloads:
 
 ```elixir
 @decorate batch(get(id, preloads), additive: [:preloads])
@@ -196,40 +163,22 @@ MyApp.UserBatcher.get(3, [:posts, :profile])
 # get_many([1, 2, 3], [:posts, :comments, :profile])
 ```
 
-**How it works:**
+Named arguments are excluded from the producer's routing key, so callers
+that differ only on additive arguments share a batch. At flush time, the
+additive values are merged using `list ++ list |> Enum.uniq/1`.
 
-- Named args are **excluded from the producer's routing key**, so
-  callers who differ only on additive args still share a batch.
-- At flush time, the additive values across all entries in the batch
-  are merged (default: `list ++ list |> Enum.uniq/1`) and the bulk
-  function receives the merged value in the same argument position.
-- Non-additive args still bucket callers normally — additive-only
-  merging doesn't affect other dimensions.
+Restrictions:
 
-**Restrictions:**
+  * Values at additive positions must be lists.
+  * `additive:` and `batch_by:` cannot be combined on the same decoration.
+  * Every name in `additive:` must appear in the decorator's group arguments.
 
-- Values at additive positions must be lists. Non-list values aren't
-  supported by the default merge.
-- `additive:` and [`batch_by:`](#batch_by--normalize-what-defines-a-batch)
-  cannot be combined on the same decoration — `batch_by:` can
-  reshape the group tuple, which breaks the position-based merging
-  `additive:` uses. Compile-time error.
-- Every name in `additive:` must appear in the decorator's group
-  args (everything after the first argument). Compile-time error
-  otherwise.
+### `batch_by:`
 
-### `batch_by:` — normalize what defines a batch
-
-For multi-arg decorations, the additional arguments beyond the
-batched variable determine which callers share a batch. By default
-those arguments are compared by Elixir's structural equality, which
-can be too strict when they contain noise that shouldn't affect
-batching — preloaded Ecto associations, extraneous metadata,
-timestamp fields, etc.
-
-`batch_by:` takes a 1-arity function that receives the raw tuple of
-the non-batched arguments and returns the canonical form used for
-both coalescing AND the bulk function's argument positions:
+Normalizes the non-batched arguments for coalescing purposes. Accepts a
+1-arity function that receives the raw tuple of non-batched arguments and
+returns the canonical form used for both coalescing and the bulk function's
+argument positions:
 
 ```elixir
 @decorate batch(
@@ -237,90 +186,35 @@ both coalescing AND the bulk function's argument positions:
   batch_by: fn {user} -> {user.id} end
 )
 def get_many(slugs, user_id) do
-  # Note: user_id is an integer here, post-normalization.
   Repo.all(from p in Post, where: p.slug in ^slugs and p.user_id == ^user_id)
 end
-
-# Call site stays ergonomic — pass the whole struct:
-MyApp.PostBatcher.get_post("hello", current_user)
 ```
 
-Two callers passing structurally-different-but-semantically-equal
-structs (e.g. the same user with and without preloaded associations)
-will coalesce into the same batch, and the bulk function sees just
-the integer id — not the struct.
+With `batch_by:`, the bulk function signature takes the normalized values,
+not the raw decorator argument types. Valid values are closures and
+captures. `batch_by:` on a single-arg decoration raises at compile time.
 
-**The trade-off worth knowing:** with `batch_by:`, the bulk function
-signature takes the *normalized* values, not the raw decorator arg
-types. The caller site passes a struct; the bulk function receives
-an integer. It's like a GraphQL resolver that works with parent
-object ids: ergonomic at the call site, efficient at the
-implementation. Document the normalized shape in the bulk function's
-@doc if you expect others to read it.
+### `correlate:`
 
-Valid values:
+Specifies how the match key is extracted from each returned record. By
+default, Flurry uses the first decorator argument's name as the record
+field. Two forms are supported:
 
-- Closures: `batch_by: fn {a, b} -> {a.id, b} end`
-- Captures: `batch_by: &MyApp.Utils.strip_preloads/1`
-
-Not supported: MFA tuples, atoms (use `correlate:` for field-name
-lookups), strings. `batch_by:` on a single-arg decoration raises at
-compile time (there are no additional arguments to normalize).
-
-### `correlate:` — pick how the match key is extracted from each record
-
-By default, Flurry uses the first decorator argument's name as both
-the generated parameter name *and* the record field to correlate by.
-`correlate:` lets you override that, in two forms:
-
-**Atom (fast path):** names a top-level field on each returned
-record.
+  * **Atom** -- names a top-level field on each returned record.
+  * **Function** -- a 1-arity function that extracts the key from each
+    record.
 
 ```elixir
-# Decorated arg is `id`, but records have a `:uuid` field.
 @decorate batch(get(id), correlate: :uuid)
 def get_many(ids) do
   Repo.all(from r in Row, where: r.uuid in ^ids)
 end
-
-MyApp.RowBatcher.get(42)   # => %{uuid: 42, ...}
 ```
 
-**Function:** a 1-arity function that extracts the key from each
-record. Use this when the match key is computed, lives in a nested
-map, or the records aren't maps at all (tuples, structs with
-irregular shapes, etc.).
+### `timeout:`
 
-```elixir
-# Records are {User, Profile} tuples from an Ecto join.
-@decorate batch(
-  get(user_id),
-  correlate: fn {user, _profile} -> user.id end
-)
-def get_many(user_ids) do
-  from(u in User,
-    join: p in Profile, on: p.user_id == u.id,
-    where: u.id in ^user_ids,
-    select: {u, p})
-  |> Repo.all()
-end
-
-# Or pulling from a nested map:
-@decorate batch(get(id), correlate: fn r -> r.meta.id end)
-def get_many(ids), do: ...
-```
-
-Both closures (`fn r -> ... end`) and captures
-(`&MyMod.extract/1`) are accepted. MFA tuples and atoms-that-aren't-
-field-names are not. Invalid values are caught at compile time.
-
-### `timeout: milliseconds`
-
-The underlying `GenServer.call/3` timeout for the generated entry
-point. Defaults to `5_000` (5 seconds). Override per decorator when
-your bulk function's work dominates the wait — e.g. a batched query
-over a large row set, or a remote API coalescer with its own
-latency budget:
+Sets the `GenServer.call/3` timeout for the generated entry point.
+Defaults to `5_000` (5 seconds).
 
 ```elixir
 @decorate batch(get(id), timeout: 30_000)
@@ -329,88 +223,43 @@ def get_many(ids) do
 end
 ```
 
-If the bulk function takes longer than `timeout`, the caller exits
-with a `:timeout` reason — the same behavior as any `GenServer.call`
-timeout.
-
 ### `returns: :one | :list`
 
-Default `:one` — each caller's argument corresponds to at most one
-returned record, matched by the argument's name as a field. If your
-bulk function legitimately returns many records per key, use
-`:list`:
+Defaults to `:one`, where each caller's argument corresponds to at most one
+returned record. Use `:list` when the bulk function returns multiple records
+per key:
 
 ```elixir
 @decorate batch(get_posts_by_user(user_id), returns: :list)
 def get_many_posts_by_user(user_ids) do
   Repo.all(from p in Post, where: p.user_id in ^user_ids)
 end
-
-MyApp.PostBatcher.get_posts_by_user(42)
-#=> [%Post{...}, %Post{...}, %Post{...}]
 ```
 
 Using `:one` on a function that returns duplicate keys raises
-`Flurry.AmbiguousBatchError` with a message pointing at the fix.
+`Flurry.AmbiguousBatchError`.
 
 ### `on_failure: :bisect | :fail_all`
 
-**Default `:bisect`.** If the bulk function raises or exits for a
-batch of N entries, Flurry splits the batch in half and retries
-each half as its own event. The recursion descends to a singleton
-failure, which isolates the bad entry — that one caller receives an
-error, and every other caller in the original batch still gets their
+Defaults to `:bisect`. When the bulk function raises or exits for a batch
+of N entries, Flurry splits the batch in half and retries each half. The
+recursion continues until a singleton failure isolates the problematic
+entry. Every other caller in the original batch still receives their
 correlated record.
 
-```elixir
-@decorate batch(get(id), on_failure: :bisect)  # explicit default
-def get_many(ids), do: ...
-```
+Use `:fail_all` to surface a single failure as an error to every caller in
+the batch without retrying.
 
-Use `:fail_all` when you want a single failure to surface as an
-error to every caller in the batch. No retry is attempted.
+> `:bisect` re-invokes the bulk function with smaller subsets of the same
+> inputs. If the bulk function has non-idempotent side effects, use
+> `on_failure: :fail_all` to avoid double-writes.
 
-> **Idempotency warning.** `:bisect` re-invokes your bulk function
-> with smaller subsets of the same inputs. If your bulk function has
-> non-idempotent side effects — e.g. `Repo.insert_all/3` where some
-> rows may have been inserted before the failure — **use
-> `on_failure: :fail_all`** to avoid double-writes. Bisect is only
-> safe for reads and other idempotent operations.
+## Multi-Argument Batching
 
-Errors delivered to callers:
-
-  * **Raised exceptions** pass through raw: `{:error, %Postgrex.Error{...}}`,
-    `{:error, %Ecto.Query.CastError{...}}`, your domain exceptions.
-    You can pattern-match on their original type.
-  * **Exits** (e.g. downstream `GenServer.call` timeouts) are wrapped
-    in `Flurry.BulkCallFailed{kind: :exit, reason: reason}` so
-    callers always see a struct.
-
-## How correlation works
-
-Given `@decorate batch(get(id))`, Flurry:
-
-1. Reads the argument name (`id`) from the decorator call.
-2. Uses it as both the parameter name of the generated `get/1` and
-   the record field to correlate by.
-3. Deduplicates caller arguments before calling your bulk function
-   (so five callers for `id=7` result in a single entry in the
-   passed list).
-4. After the bulk function returns, builds a map
-   `%{record.id => record}` and replies to each caller with the
-   record matching their argument.
-
-Missing records become `nil` in `:one` mode or `[]` in `:list`
-mode.
-
-## Multi-arg batching
-
-If your decorated function takes more than one argument, the **first**
-argument is the batched variable and the **remaining** arguments
-select which callers share a batch. Callers whose non-batched
-arguments are structurally equal coalesce into the same bulk call;
-callers with different non-batched arguments run as independent
-batches.
+When the decorated function takes more than one argument, the first
+argument is the batched variable and the remaining arguments determine
+which callers share a batch. Callers whose non-batched arguments are
+structurally equal coalesce into the same bulk call.
 
 ```elixir
 @decorate batch(get_post(slug, user_id, active?))
@@ -420,119 +269,51 @@ def get_many_posts(slugs, user_id, active?) do
       where: p.slug in ^slugs and p.user_id == ^user_id and p.active == ^active?
   )
 end
-
-# These four calls produce THREE separate bulk invocations, one per
-# distinct (user_id, active?) combination:
-PostBatcher.get_post("a", 1, true)   # {1, true}
-PostBatcher.get_post("b", 1, true)   # {1, true}  (coalesces with "a")
-PostBatcher.get_post("c", 2, true)   # {2, true}  (own batch)
-PostBatcher.get_post("d", 1, false)  # {1, false} (own batch)
 ```
 
-Each distinct combination has its own pending list, its own
-`batch_size` cap, its own priority queue for bisect retries, and its
-own slot in the producer's LRU flush rotation so one combination
-can't starve the others.
-
-The decorator's first argument name is still the correlation field
-(`slug` in the example above — each returned record must have a
-`:slug` field matching the caller's request). To customize how the
-non-batched arguments are compared — e.g. to strip preloaded Ecto
-associations or ignore noise fields — see [`batch_by:`](#batch_by--normalize-what-defines-a-batch).
+Each distinct combination of non-batched arguments has its own pending
+list, `batch_size` cap, and slot in the producer's LRU flush rotation.
 
 ## Transactions
 
-Flurry's bulk function runs in a background consumer process, not in
-the caller's process. That has two concrete consequences for database
-transactions that every user should understand — and the first one is
-much more dangerous than the second.
+The bulk function runs in a background consumer process, not in the
+caller's process. This has consequences for database transactions:
 
-1. **Writes made by the bulk function do NOT participate in the
-   caller's transaction.** Because the consumer uses a different DB
-   connection, any inserts/updates/deletes the bulk function performs
-   are committed on the consumer's connection independently of the
-   caller's transaction. If the caller's transaction later rolls
-   back, those writes are **not rolled back** — committed state
-   survives a "failed" transaction. This is a data integrity issue
-   for any **mutation batcher** (insert, update, delete) and must be
-   addressed by using `in_transaction: :bypass` on the decorator.
-2. **Reads made by the bulk function do NOT see the caller's
-   uncommitted writes.** If the caller has updated a row inside the
-   transaction and then calls a batched read, the read will see the
-   pre-update (committed) state, not the caller's in-progress update.
-   This is a consistency issue (read-your-writes), less severe than
-   the rollback problem but still worth knowing about. It usually
-   doesn't matter for read batchers called before any writes in the
-   same transaction.
-3. **Under `Ecto.Adapters.SQL.Sandbox` in tests**, the sandbox routes
-   queries by walking the calling process's `$callers`/`$ancestors`
-   ancestry to find the test that checked out a connection. The
-   consumer has no ancestry link to any test, so its queries hit
-   ownership errors under `:manual` mode.
+  1. **Writes** performed by the bulk function do not participate in the
+     caller's transaction. If the caller's transaction rolls back, those
+     writes are not rolled back.
+  2. **Reads** performed by the bulk function do not see the caller's
+     uncommitted writes.
+  3. **Under `Ecto.Adapters.SQL.Sandbox`**, the consumer has no ancestry
+     link to the test process, so queries produce ownership errors under
+     `:manual` mode.
 
-Flurry handles all three via the mandatory `repo:` option and a
-per-decorator `in_transaction:` setting.
+### `use Flurry, repo: ...`
 
-### `use Flurry, repo: ...` is mandatory
+The `repo:` option is mandatory. Pass the Ecto repo module, or `:none` for
+batchers with no database involvement:
 
 ```elixir
-use Flurry, repo: MyApp.Repo   # standard — uses Repo.checked_out?/0
-use Flurry, repo: :none        # no DB involvement, skip transaction handling
+use Flurry, repo: MyApp.Repo
+use Flurry, repo: :none
 ```
-
-Omitting `:repo` is a compile-time error. The explicit choice forces
-you to think about transaction semantics instead of finding out in
-production.
 
 ### `in_transaction: :warn | :safe | :bypass`
 
-Three modes, set per decorator. With a real repo the default is
-`:warn`; with `repo: :none` the default is `:safe` (and `:warn` /
-`:bypass` are compile errors).
+Controls behavior when the generated entry point is called inside a
+transaction. With a real repo the default is `:warn`; with `repo: :none`
+the default is `:safe`.
 
-```elixir
-# Default — warns at runtime if called inside a transaction, still batches
-@decorate batch(get(id))
-def get_many(ids), do: Repo.all(from u in User, where: u.id in ^ids)
-
-# "I've reviewed this, batching inside transactions is fine" — no warning
-@decorate batch(get(id), in_transaction: :safe)
-def get_many(ids), do: Repo.all(from u in User, where: u.id in ^ids)
-
-# Bypass — inside a transaction, runs the bulk fn inline in the caller's
-# process so it participates in the transaction / rollback semantics.
-# Outside a transaction, batches normally.
-@decorate batch(insert(attrs), in_transaction: :bypass)
-def insert_many(attrs_list), do: Repo.insert_all(User, attrs_list, returning: true)
-```
-
-**When to use each:**
-
-- **`:bypass`** — **mandatory for any batcher that writes.** When
-  called inside a transaction, Flurry skips the pipeline and runs
-  the bulk function inline in the caller's process, so writes
-  execute on the caller's connection and participate in the
-  transaction's commit/rollback. Outside a transaction, batches
-  normally. This is the only mode that is safe for mutation
-  batchers. You lose batching for transactional calls, but you keep
-  atomicity — which is why you chose to be in a transaction.
-- **`:warn`** (default) — the driving signal is *"you didn't think
-  about this; think about it now."* Every call logs a warning if
-  `Repo.checked_out?/0` returns true. If this is a write batcher,
-  the warning is telling you to switch to `:bypass`. If it's a read
-  batcher and you've confirmed it doesn't need read-your-writes,
-  switch to `:safe`.
-- **`:safe`** — you've confirmed the batched call is a read that
-  doesn't need read-your-writes consistency with any preceding
-  writes in the same transaction. Typical for read batchers called
-  early in a transaction body, or for reads of data the current
-  transaction isn't mutating. **Never use `:safe` for a batcher
-  that writes to the database** — your writes will escape the
-  transaction and won't roll back.
+  * **`:warn`** -- Logs a warning when `Repo.checked_out?/0` returns true.
+  * **`:safe`** -- Suppresses the warning. Use for reads that do not require
+    read-your-writes consistency.
+  * **`:bypass`** -- Runs the bulk function inline in the caller's process
+    when inside a transaction, so writes participate in the transaction's
+    commit/rollback semantics. Outside a transaction, batches normally.
 
 ### Tests with Ecto SQL Sandbox
 
-Enable global bypass in your `test_helper.exs`:
+Enable global bypass in `test_helper.exs`:
 
 ```elixir
 ExUnit.start()
@@ -540,34 +321,16 @@ Flurry.Testing.enable_bypass_globally()
 ```
 
 With bypass enabled, every call to a decorated function runs the bulk
-function inline in the caller's process — which, under the sandbox,
-has ancestry back to the test and a properly checked-out connection.
-`async: true` works out of the box.
-
-The tradeoff: the batching pipeline itself isn't exercised in your
-unit tests. The bulk function's own logic is still fully tested (it
-runs with a singleton list), but producer/consumer behavior is not.
-If you want integration tests of the pipeline, write them without
-calling `enable_bypass_globally()` for that suite.
+function inline in the caller's process. The batching pipeline is not
+exercised in unit tests.
 
 ## Limitations
 
-- **The bulk function bypasses the pipeline.** Calling your
-  user-defined `get_many/1` (the plural, decorated function)
-  directly runs in the caller's process with its own DB connection
-  — it does not coalesce with concurrent singular callers. Callers
-  with a list of ids in hand who want to participate in batching
-  currently have to call `get/1` per element via `Task.async_stream`.
-  Tracked in [issue #2](https://github.com/twinn/flurry/issues/2).
-- **Additive merging uses a fixed default merge function.** The
-  default is `list ++ list |> Enum.uniq/1`, which works for flat
-  lists of atoms (e.g. Ecto preloads as `[:posts, :comments]`) but
-  is wrong for nested preload trees like
-  `[posts: [:comments]] ++ [posts: [:author]]` (you get two
-  `:posts` keys instead of one merged subtree). A user-supplied
-  merge function per additive arg is tracked as a follow-up in
-  [issue #1](https://github.com/twinn/flurry/issues/1).
+  * Calling the bulk function directly (e.g., `get_many/1`) runs in the
+    caller's process and does not coalesce with concurrent singular callers.
+  * The default additive merge function (`list ++ list |> Enum.uniq/1`)
+    does not support nested preload trees.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT -- see [LICENSE](LICENSE).

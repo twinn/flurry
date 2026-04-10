@@ -1,10 +1,12 @@
 defmodule Flurry.Decorators do
   @moduledoc """
-  Defines the `@decorate batch(...)` decorator used by modules that
-  `use Flurry`. You don't normally interact with this module directly —
-  `use Flurry` brings the decorator into scope.
+  Provides the `@decorate batch(...)` decorator used by modules that
+  `use Flurry`.
 
-  ## Shapes
+  This module is not intended to be used directly. `use Flurry` brings the
+  decorator into scope automatically.
+
+  ## Decorator Syntax
 
       @decorate batch(get(id))
       def get_many(ids), do: ...
@@ -12,10 +14,10 @@ defmodule Flurry.Decorators do
       @decorate batch(get_by_group(group), returns: :list)
       def get_many_by_group(groups), do: ...
 
-  The first argument is a fake call expression whose *function name* becomes
-  the generated singular entry-point and whose *single argument name* becomes
-  both the parameter of that entry point and the record field used to
-  correlate bulk results back to individual callers.
+  The argument to `batch/1` is a call expression whose function name becomes
+  the generated singular entry point. The first argument name serves as both
+  the parameter of that entry point and the record field used to correlate
+  bulk results back to individual callers.
   """
 
   use Decorator.Define, batch: 1, batch: 2
@@ -47,6 +49,7 @@ defmodule Flurry.Decorators do
     # the caller's arg name.
     correlate = Keyword.get(opts, :correlate, key)
     timeout = Keyword.get(opts, :timeout, 5_000)
+    max_wait = Keyword.get(opts, :max_wait, 200)
     # `batch_by` arrives as AST because it's a function expression
     # (closure or capture) — it doesn't get evaluated by the decorator
     # library, only stashed for `__before_compile__` to unquote into
@@ -67,6 +70,7 @@ defmodule Flurry.Decorators do
       {:correlate, correlate, &Flurry.Decorators.valid_correlate?/1,
        "must be an atom (record field name) or a function expression like `fn r -> r.nested.id end`"},
       {:timeout, timeout, &(is_integer(&1) and &1 > 0), "must be a positive integer (milliseconds)"},
+      {:max_wait, max_wait, &(&1 == nil or (is_integer(&1) and &1 > 0)), "must be a positive integer (milliseconds)"},
       {:batch_by, batch_by, &(&1 == nil or Flurry.Decorators.function_ast?(&1)),
        "must be a function expression (e.g. `fn tuple -> ... end` or `&MyMod.fun/1`)"}
     ]
@@ -99,6 +103,7 @@ defmodule Flurry.Decorators do
       on_failure: on_failure,
       in_transaction: in_transaction,
       timeout: timeout,
+      max_wait: max_wait,
       # Stored as raw AST — `__before_compile__` unquotes it directly
       # into the generated entry point, then strips this key from the
       # batch map before it gets escaped into `__flurry_batches__/0`.

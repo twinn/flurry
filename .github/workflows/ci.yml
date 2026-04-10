@@ -8,7 +8,7 @@ on:
 
 jobs:
   test:
-    name: Elixir ${{ matrix.elixir }} / OTP ${{ matrix.otp }}
+    name: Test (Elixir ${{ matrix.elixir }} / OTP ${{ matrix.otp }})
     runs-on: ubuntu-latest
 
     strategy:
@@ -37,8 +37,6 @@ jobs:
           key: ${{ runner.os }}-mix-${{ matrix.elixir }}-${{ matrix.otp }}-${{ hashFiles('mix.lock') }}
           restore-keys: ${{ runner.os }}-mix-${{ matrix.elixir }}-${{ matrix.otp }}-
 
-      # Dialyzer PLT cache — keyed on the Elixir/OTP pair and mix.lock
-      # so it rebuilds only when deps change. Saves ~3 minutes per run.
       - uses: actions/cache@v4
         with:
           path: priv/plts
@@ -48,5 +46,6 @@ jobs:
       - run: mix deps.get
       - run: mix compile --warnings-as-errors
       - run: mix format --check-formatted
-      - run: mix dialyzer --format github
+      - run: mix credo --strict
       - run: mix test
+      - run: mix dialyzer --format github

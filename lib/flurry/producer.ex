@@ -5,6 +5,7 @@ defmodule Flurry.Producer do
   #
   #   * any group's pending >= batch_size → flush that group
   #   * mailbox empty → flush the least-recently-used non-empty group
+  #   * max_wait timer fires → force-flush the LRU group
   #   * otherwise → hold, we expect more requests
   #
   # The "mailbox empty" check uses `Process.info(self(), :message_queue_len)`
@@ -12,6 +13,11 @@ defmodule Flurry.Producer do
   # return from `handle_call` / `handle_demand`. A zero length at that moment
   # means "no further requests are immediately queued for us" — it's safe to
   # flush now instead of holding.
+  #
+  # The max_wait timer starts when the first entry arrives in an empty
+  # producer. When it fires, `force_flush` is set so `maybe_emit` flushes
+  # regardless of mailbox state. The timer is cancelled when all groups
+  # drain, and restarted if entries remain after a forced flush.
   #
   # ## Groups
   #
@@ -36,6 +42,9 @@ defmodule Flurry.Producer do
       module: opts[:module],
       batch: opts[:batch],
       batch_size: opts[:batch_size] || 100,
+      max_wait: opts[:max_wait],
+      flush_timer: nil,
+      force_flush: false,
       pending: %{},
       group_order: [],
       priority: [],
@@ -53,8 +62,10 @@ defmodule Flurry.Producer do
     # the 3-tuple form {arg, additive_values, from} — at emission time
     # we strip it back to {arg, from} for the event.
     {routing_key, additive_values} = split_tuple(group_tuple, state.batch.additive_positions)
+    was_empty = map_size(state.pending) == 0
     state = enqueue(state, routing_key, arg, additive_values, from)
     {events, state} = do_maybe_emit(state)
+    state = manage_flush_timer(state, was_empty)
     {:noreply, events, state}
   end
 
@@ -77,6 +88,44 @@ defmodule Flurry.Producer do
     {:noreply, events, state}
   end
 
+  @impl true
+  def handle_info(:max_wait_flush, state) do
+    state = %{state | flush_timer: nil, force_flush: true}
+    {events, state} = do_maybe_emit(state)
+    state = manage_flush_timer(state, false)
+    {:noreply, events, state}
+  end
+
+  def handle_info(_msg, state), do: {:noreply, [], state}
+
+  # Starts, cancels, or leaves the flush timer alone based on pending state.
+  # Called after enqueue and after max_wait_flush fires.
+  defp manage_flush_timer(%{max_wait: nil} = state, _was_empty), do: state
+
+  defp manage_flush_timer(%{max_wait: max_wait} = state, was_empty) do
+    cond do
+      # All groups drained — cancel any running timer.
+      map_size(state.pending) == 0 ->
+        cancel_flush_timer(state)
+
+      # First entry into an empty producer — start the timer.
+      was_empty and state.flush_timer == nil ->
+        ref = Process.send_after(self(), :max_wait_flush, max_wait)
+        %{state | flush_timer: ref}
+
+      # Timer already running or wasn't empty before — leave it.
+      true ->
+        state
+    end
+  end
+
+  defp cancel_flush_timer(%{flush_timer: nil} = state), do: state
+
+  defp cancel_flush_timer(%{flush_timer: ref} = state) do
+    _ = Process.cancel_timer(ref)
+    %{state | flush_timer: nil}
+  end
+
   defp enqueue(state, routing_key, arg, additive_values, from) do
     existing = Map.get(state.pending, routing_key, [])
     new_list = existing ++ [{arg, additive_values, from}]
@@ -96,19 +145,21 @@ defmodule Flurry.Producer do
   end
 
   @doc """
-  Pure decision function for the producer's flush policy. Extracted so the
-  mailbox-peek behavior can be exercised deterministically in unit tests
-  without coordinating real mailbox state.
+  Determines whether the producer should emit a batch event given the
+  current state and mailbox queue length.
+
+  This function is extracted from the GenStage callbacks so that the
+  flush policy can be exercised deterministically in unit tests without
+  coordinating real mailbox state.
 
   Priority batches (pre-formed by the consumer via bisect) take precedence
-  over pending — we drain the entire priority queue one batch at a time
-  before emitting anything from pending. Priority items carry their own
-  group key so they route to the correct group's consumer context.
+  over pending entries. The priority queue is drained one batch at a time
+  before emitting anything from pending.
 
-  Pending emission picks a group by:
+  Pending emission selects a group by:
+
     1. Scanning for any group whose pending count has reached `batch_size`.
-    2. Otherwise, if the mailbox is empty, picking the front (LRU) of
-       `group_order`.
+    2. If the mailbox is empty, selecting the front (LRU) of `group_order`.
     3. Otherwise, holding.
   """
   @spec maybe_emit(map(), non_neg_integer()) :: {list(), map()}
@@ -126,10 +177,11 @@ defmodule Flurry.Producer do
 
   def maybe_emit(state, qlen) do
     saturated = find_saturated(state)
+    force = Map.get(state, :force_flush, false)
 
     cond do
       saturated != nil -> flush_group(state, saturated)
-      qlen == 0 -> flush_group(state, hd(state.group_order))
+      qlen == 0 or force -> flush_group(%{state | force_flush: false}, hd(state.group_order))
       true -> {[], state}
     end
   end
@@ -165,10 +217,12 @@ defmodule Flurry.Producer do
   end
 
   @doc """
-  Splits a group tuple into a routing-key tuple (non-additive values in
-  their original order) and a list of additive values (in the order of
-  `additive_positions`). For non-additive batches (`additive_positions == []`)
-  the routing key equals the input tuple and additive values is `[]`.
+  Splits a group tuple into a routing-key tuple and a list of additive values.
+
+  The routing-key tuple contains non-additive values in their original order.
+  The additive values list follows the order of `additive_positions`. For
+  non-additive batches (`additive_positions == []`), the routing key equals
+  the input tuple and the additive values list is empty.
   """
   @spec split_tuple(tuple(), [non_neg_integer()]) :: {tuple(), [term()]}
   def split_tuple(group_tuple, []), do: {group_tuple, []}
@@ -193,10 +247,11 @@ defmodule Flurry.Producer do
   end
 
   @doc """
-  Merges additive values across a list of entries, position-by-position.
-  Each entry's additive_values is a list of the same length as the
-  caller's `additive_positions`. The default merge is list concatenation
-  followed by `Enum.uniq/1`.
+  Merges additive values across a list of entries, position by position.
+
+  Each entry's additive values list has the same length as `additive_positions`.
+  The default merge concatenates the lists and removes duplicates via
+  `Enum.uniq/1`.
   """
   @spec merge_additive_values([{term(), [term()], GenServer.from()}], non_neg_integer()) ::
           [term()]
@@ -213,8 +268,8 @@ defmodule Flurry.Producer do
   end
 
   @doc """
-  Reconstructs the full group tuple from a routing-key tuple and a list
-  of merged additive values, interleaving them back into the original
+  Reconstructs the full group tuple from a routing-key tuple and a list of
+  merged additive values by interleaving them back into the original
   positions.
   """
   @spec reconstruct_tuple(tuple(), [term()], [non_neg_integer()]) :: tuple()

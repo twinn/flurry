@@ -1,17 +1,35 @@
 # Changelog
 
-## Unreleased
+All notable changes to this project will be documented in this file.
 
-Initial implementation.
+This project adheres to [Semantic Versioning](https://semver.org/).
 
-- `use Flurry` macro + `@decorate batch(...)` decorator for declaring
-  scatter-gather batched functions. User writes the bulk (list-in / list-out)
-  implementation; Flurry generates the single-item entry point that enqueues,
-  blocks, and replies with the correlated result.
+## [0.1.0] - 2026-04-10
+
+### Added
+
+- `use Flurry` macro and `@decorate batch(...)` decorator for declaring
+  scatter-gather batched functions. The user defines a bulk (list-in,
+  list-out) implementation; Flurry generates the single-item entry point
+  that enqueues, blocks, and replies with the correlated result.
 - GenStage-based producer/consumer pair per decorated function.
-- Opportunistic mailbox-peek flushing: flush when either `batch_size` is
-  reached, or the producer's mailbox is empty — no arbitrary timers.
+- Flush policy: batches are emitted when `batch_size` is reached, the
+  producer's mailbox is empty, or `max_wait` milliseconds have elapsed
+  since the first pending request.
+- `max_wait:` option (default 200ms) to cap worst-case flush latency under
+  slow trickle conditions.
 - Automatic input deduplication and key-based result correlation.
-- Scalar (`returns: :one`, default) and grouped (`returns: :list`) modes.
-  Scalar mode raises `Flurry.AmbiguousBatchError` if the bulk function
-  returns duplicate keys.
+- Scalar (`returns: :one`, default) and grouped (`returns: :list`) return
+  modes. Scalar mode raises `Flurry.AmbiguousBatchError` when the bulk
+  function returns duplicate keys.
+- Multi-argument batching with group-key partitioning.
+- `batch_by:` option for normalizing non-batched arguments.
+- `additive:` option for merging list-valued arguments across coalesced
+  callers.
+- `correlate:` option for custom key extraction from result records.
+- `on_failure: :bisect | :fail_all` error handling strategies.
+- `in_transaction: :warn | :safe | :bypass` transaction-aware modes.
+- `overridable:` option on `use Flurry` for wrapping generated functions
+  via `super/1`.
+- `Flurry.Testing` module with bypass mode for use with
+  `Ecto.Adapters.SQL.Sandbox`.

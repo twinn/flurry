@@ -707,6 +707,50 @@ defmodule Flurry.IntegrationTest do
     end
   end
 
+  describe "max_wait flush" do
+    defmodule MaxWaitBatcher do
+      @moduledoc false
+      use Flurry, repo: :none
+
+      @decorate batch(get(id), max_wait: 100, batch_size: 100_000)
+      def get_many(ids) do
+        Enum.map(ids, &%{id: &1})
+      end
+    end
+
+    setup do
+      start_supervised!(MaxWaitBatcher)
+      :ok
+    end
+
+    test "callers complete even with enormous batch_size" do
+      tasks = for i <- 1..5, do: Task.async(fn -> MaxWaitBatcher.get(i) end)
+      results = Task.await_many(tasks, 2_000)
+
+      assert length(results) == 5
+      assert Enum.all?(results, &match?(%{id: _}, &1))
+    end
+  end
+
+  describe "max_wait: default 200ms" do
+    # Verifies that the default max_wait of 200ms is applied when no
+    # explicit value is given.
+    defmodule DefaultMaxWaitBatcher do
+      @moduledoc false
+      use Flurry, repo: :none
+
+      @decorate batch(get(id))
+      def get_many(ids) do
+        Enum.map(ids, &%{id: &1})
+      end
+    end
+
+    test "__flurry_batches__ includes default max_wait of 200" do
+      [batch] = DefaultMaxWaitBatcher.__flurry_batches__()
+      assert batch.max_wait == 200
+    end
+  end
+
   describe "error propagation" do
     test "an exception in the bulk function is delivered to all callers" do
       defmodule Exploder do

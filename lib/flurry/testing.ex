@@ -1,41 +1,41 @@
 defmodule Flurry.Testing do
   @moduledoc """
-  Test-mode helpers for Flurry.
+  Provides test-mode helpers for Flurry.
 
-  ## Bypass mode
+  ## Bypass Mode
 
   In a test environment with `Ecto.Adapters.SQL.Sandbox`, the sandbox
-  walks `$callers` / `$ancestors` from the querying process to find the
-  test that owns the checked-out connection. Flurry's default pipeline
-  runs the bulk function in a background consumer process that has **no
-  ancestry link** to any test, so the sandbox cannot route its queries.
+  resolves connection ownership by walking `$callers`/`$ancestors` from the
+  querying process. Because Flurry's consumer process has no ancestry link
+  to any test, the sandbox cannot route its queries.
 
-  Enabling *bypass mode* makes Flurry skip the producer/consumer pipeline
-  entirely: the bulk function runs inline in the caller's process, the
-  sandbox walks ancestry normally, and `async: true` tests work.
+  Enabling bypass mode causes Flurry to skip the producer/consumer pipeline
+  entirely. The bulk function runs inline in the caller's process, allowing
+  the sandbox to resolve ownership normally. `async: true` tests work
+  without additional configuration.
 
-  Add this to your `test_helper.exs`:
+  Add the following to `test_helper.exs`:
 
       ExUnit.start()
       Flurry.Testing.enable_bypass_globally()
 
-  Or equivalently:
+  Or equivalently, in `config/test.exs`:
 
-      # config/test.exs
       config :flurry, bypass_batching: true
 
   With bypass enabled, every call to a decorated function runs the bulk
-  function with a singleton list in the caller's process, correlates
-  the result, and returns. The batching pipeline is not exercised —
-  the tradeoff is that unit tests don't cover producer/consumer behavior,
-  only the bulk function's own logic. If you want to test the batching
-  pipeline itself, write integration tests that don't enable bypass.
+  function with a singleton list in the caller's process, correlates the
+  result, and returns. The batching pipeline is not exercised; unit tests
+  cover only the bulk function's own logic. To test the batching pipeline
+  itself, write integration tests without enabling bypass.
   """
 
   @doc """
-  Enables bypass mode globally via `Application.put_env/3`. Call this in
-  your `test_helper.exs` so that every test in your suite skips the
-  batching pipeline and runs the bulk function inline.
+  Enables bypass mode globally via `Application.put_env/3`.
+
+  When called in `test_helper.exs`, every test in the suite skips the
+  batching pipeline and runs the bulk function inline in the caller's
+  process.
   """
   @spec enable_bypass_globally() :: :ok
   def enable_bypass_globally do
@@ -44,8 +44,9 @@ defmodule Flurry.Testing do
   end
 
   @doc """
-  Disables bypass mode globally. Useful if you want specific tests to
-  exercise the real batching pipeline.
+  Disables bypass mode globally.
+
+  Allows subsequent tests to exercise the real batching pipeline.
   """
   @spec disable_bypass_globally() :: :ok
   def disable_bypass_globally do
@@ -54,9 +55,10 @@ defmodule Flurry.Testing do
   end
 
   @doc """
-  Returns `true` if Flurry is configured to bypass the batching pipeline
-  and run bulk functions inline in the caller's process. Checked by every
-  generated entry point before dispatching.
+  Returns `true` if Flurry is configured to bypass the batching pipeline.
+
+  Checked by every generated entry point before dispatching to the
+  producer/consumer pipeline.
   """
   @spec bypass?() :: boolean()
   def bypass? do

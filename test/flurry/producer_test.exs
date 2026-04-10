@@ -27,7 +27,8 @@ defmodule Flurry.ProducerTest do
       pending: pending_map,
       group_order: group_order,
       demand: demand,
-      priority: Keyword.get(opts, :priority, [])
+      priority: Keyword.get(opts, :priority, []),
+      force_flush: Keyword.get(opts, :force_flush, false)
     }
   end
 
@@ -310,6 +311,37 @@ defmodule Flurry.ProducerTest do
       assert {[{:flurry_batch, _, _, @ga, entries}], s1} = Producer.maybe_emit(s0, 0)
       assert Enum.map(entries, fn {a, _} -> a end) == [100, 101, 102]
       assert length(s1.pending[@gb]) == 3
+    end
+  end
+
+  describe "maybe_emit/2 — max_wait forced flush" do
+    # When the max_wait timer fires, it sets `force_flush: true` in state.
+    # maybe_emit should then flush the LRU group even when qlen > 0
+    # (normally it would hold).
+
+    test "with force_flush true and non-empty mailbox, flushes instead of holding" do
+      pending = Enum.map(1..3, &entry/1)
+      s0 = pending |> single_group(1, batch_size: 100) |> Map.put(:force_flush, true)
+
+      # qlen=5 means mailbox is non-empty — normally holds. But
+      # force_flush overrides.
+      assert {[event], s1} = Producer.maybe_emit(s0, 5)
+      assert {:flurry_batch, _, _, @g, entries} = event
+      assert length(entries) == 3
+      assert s1.force_flush == false
+    end
+
+    test "with force_flush false and non-empty mailbox, holds as usual" do
+      pending = Enum.map(1..3, &entry/1)
+      s0 = pending |> single_group(1, batch_size: 100) |> Map.put(:force_flush, false)
+
+      assert {[], _s1} = Producer.maybe_emit(s0, 5)
+    end
+
+    test "force_flush is cleared after the flush" do
+      s0 = [entry(1)] |> single_group(1) |> Map.put(:force_flush, true)
+      {[_], s1} = Producer.maybe_emit(s0, 5)
+      assert s1.force_flush == false
     end
   end
 
