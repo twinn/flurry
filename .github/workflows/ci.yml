@@ -7,45 +7,6 @@ on:
     branches: [main]
 
 jobs:
-  format:
-    name: Format
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: erlef/setup-beam@v1
-        with:
-          elixir-version: "1.17"
-          otp-version: "27"
-
-      - run: mix deps.get
-      - run: mix format --check-formatted
-
-  credo:
-    name: Credo
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: erlef/setup-beam@v1
-        with:
-          elixir-version: "1.17"
-          otp-version: "27"
-
-      - uses: actions/cache@v4
-        with:
-          path: |
-            deps
-            _build
-          key: ${{ runner.os }}-mix-1.17-27-${{ hashFiles('mix.lock') }}
-          restore-keys: ${{ runner.os }}-mix-1.17-27-
-
-      - run: mix deps.get
-      - run: mix compile --warnings-as-errors
-      - run: mix credo --strict
-
   dialyzer:
     name: Dialyzer
     runs-on: ubuntu-latest
@@ -108,4 +69,6 @@ jobs:
 
       - run: mix deps.get
       - run: mix compile --warnings-as-errors
+      - run: mix format --check-formatted
+      - run: mix credo --strict
       - run: mix test
