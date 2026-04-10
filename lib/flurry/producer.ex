@@ -122,7 +122,7 @@ defmodule Flurry.Producer do
   defp cancel_flush_timer(%{flush_timer: nil} = state), do: state
 
   defp cancel_flush_timer(%{flush_timer: ref} = state) do
-    Process.cancel_timer(ref)
+    _ = Process.cancel_timer(ref)
     %{state | flush_timer: nil}
   end
 
