@@ -5,6 +5,7 @@ defmodule Flurry.Producer do
   #
   #   * any group's pending >= batch_size → flush that group
   #   * mailbox empty → flush the least-recently-used non-empty group
+  #   * max_wait timer fires → force-flush the LRU group
   #   * otherwise → hold, we expect more requests
   #
   # The "mailbox empty" check uses `Process.info(self(), :message_queue_len)`
@@ -12,6 +13,11 @@ defmodule Flurry.Producer do
   # return from `handle_call` / `handle_demand`. A zero length at that moment
   # means "no further requests are immediately queued for us" — it's safe to
   # flush now instead of holding.
+  #
+  # The max_wait timer starts when the first entry arrives in an empty
+  # producer. When it fires, `force_flush` is set so `maybe_emit` flushes
+  # regardless of mailbox state. The timer is cancelled when all groups
+  # drain, and restarted if entries remain after a forced flush.
   #
   # ## Groups
   #
@@ -36,6 +42,9 @@ defmodule Flurry.Producer do
       module: opts[:module],
       batch: opts[:batch],
       batch_size: opts[:batch_size] || 100,
+      max_wait: opts[:max_wait],
+      flush_timer: nil,
+      force_flush: false,
       pending: %{},
       group_order: [],
       priority: [],
@@ -53,8 +62,10 @@ defmodule Flurry.Producer do
     # the 3-tuple form {arg, additive_values, from} — at emission time
     # we strip it back to {arg, from} for the event.
     {routing_key, additive_values} = split_tuple(group_tuple, state.batch.additive_positions)
+    was_empty = map_size(state.pending) == 0
     state = enqueue(state, routing_key, arg, additive_values, from)
     {events, state} = do_maybe_emit(state)
+    state = manage_flush_timer(state, was_empty)
     {:noreply, events, state}
   end
 
@@ -75,6 +86,44 @@ defmodule Flurry.Producer do
     state = %{state | priority: state.priority ++ tagged}
     {events, state} = do_maybe_emit(state)
     {:noreply, events, state}
+  end
+
+  @impl true
+  def handle_info(:max_wait_flush, state) do
+    state = %{state | flush_timer: nil, force_flush: true}
+    {events, state} = do_maybe_emit(state)
+    state = manage_flush_timer(state, false)
+    {:noreply, events, state}
+  end
+
+  def handle_info(_msg, state), do: {:noreply, [], state}
+
+  # Starts, cancels, or leaves the flush timer alone based on pending state.
+  # Called after enqueue and after max_wait_flush fires.
+  defp manage_flush_timer(%{max_wait: nil} = state, _was_empty), do: state
+
+  defp manage_flush_timer(%{max_wait: max_wait} = state, was_empty) do
+    cond do
+      # All groups drained — cancel any running timer.
+      map_size(state.pending) == 0 ->
+        cancel_flush_timer(state)
+
+      # First entry into an empty producer — start the timer.
+      was_empty and state.flush_timer == nil ->
+        ref = Process.send_after(self(), :max_wait_flush, max_wait)
+        %{state | flush_timer: ref}
+
+      # Timer already running or wasn't empty before — leave it.
+      true ->
+        state
+    end
+  end
+
+  defp cancel_flush_timer(%{flush_timer: nil} = state), do: state
+
+  defp cancel_flush_timer(%{flush_timer: ref} = state) do
+    Process.cancel_timer(ref)
+    %{state | flush_timer: nil}
   end
 
   defp enqueue(state, routing_key, arg, additive_values, from) do
@@ -128,10 +177,11 @@ defmodule Flurry.Producer do
 
   def maybe_emit(state, qlen) do
     saturated = find_saturated(state)
+    force = Map.get(state, :force_flush, false)
 
     cond do
       saturated != nil -> flush_group(state, saturated)
-      qlen == 0 -> flush_group(state, hd(state.group_order))
+      qlen == 0 or force -> flush_group(%{state | force_flush: false}, hd(state.group_order))
       true -> {[], state}
     end
   end

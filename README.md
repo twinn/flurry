@@ -51,15 +51,19 @@ MyApp.UserBatcher.get(999)
 
 ## Flush Policy
 
-Flurry does not use a flush timer. A batch is emitted when either:
+A batch is emitted when any of the following conditions is met:
 
   * `batch_size` pending requests have accumulated, or
   * the producer's mailbox is empty, meaning no further requests are
-    immediately queued.
+    immediately queued, or
+  * `max_wait` milliseconds have elapsed since the first pending request
+    was enqueued.
 
-This provides maximum coalescing under bursts and minimum latency under
-low load: a single request arriving at an idle producer flushes immediately
-as a batch of one.
+The mailbox-empty check provides minimum latency under low load: a single
+request arriving at an idle producer flushes immediately as a batch of one.
+The `max_wait` timer (default 200ms) caps worst-case latency under slow
+trickle conditions where requests arrive one at a time, fast enough to keep
+the mailbox non-empty but too slowly to reach `batch_size`.
 
 ## Starting the Batcher
 
@@ -94,6 +98,20 @@ def get_many_with_posts(ids), do: ...
 
 When more requests accumulate than `batch_size` allows, Flurry flushes
 `batch_size` entries at a time across successive cycles.
+
+### `max_wait:`
+
+Maximum time in milliseconds that the first pending request waits before
+the producer forces a flush. Defaults to `200`. Set to `nil` to disable.
+
+```elixir
+# Module-wide default
+children = [{MyApp.UserBatcher, max_wait: 500}]
+
+# Per-decorated-function override
+@decorate batch(get(id), max_wait: 100)
+def get_many(ids), do: ...
+```
 
 ### `overridable:`
 

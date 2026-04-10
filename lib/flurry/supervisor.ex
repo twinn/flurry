@@ -16,17 +16,26 @@ defmodule Flurry.Supervisor do
   @impl true
   def init({module, batches, opts}) do
     default_batch_size = Keyword.get(opts, :batch_size, 100)
+    default_max_wait = Keyword.get(opts, :max_wait, 200)
 
     children =
       Enum.flat_map(batches, fn batch ->
         producer_name = Flurry.Runtime.producer_name(module, batch.singular)
         consumer_name = Flurry.Runtime.consumer_name(module, batch.singular)
-        # A decorator-level `batch_size:` wins over the start_link default.
+        # A decorator-level override wins over the start_link default.
         effective_batch_size = batch[:batch_size] || default_batch_size
+        effective_max_wait = batch[:max_wait] || default_max_wait
 
         [
           Supervisor.child_spec(
-            {Flurry.Producer, [name: producer_name, module: module, batch: batch, batch_size: effective_batch_size]},
+            {Flurry.Producer,
+             [
+               name: producer_name,
+               module: module,
+               batch: batch,
+               batch_size: effective_batch_size,
+               max_wait: effective_max_wait
+             ]},
             id: producer_name
           ),
           Supervisor.child_spec(

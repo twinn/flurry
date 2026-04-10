@@ -30,15 +30,19 @@ defmodule Flurry do
 
   ## Flush Policy
 
-  Flurry does not use a flush timer. A batch is emitted when either:
+  A batch is emitted when any of the following conditions is met:
 
     * `batch_size` (default 100) pending requests have accumulated, or
     * the producer's mailbox is empty, meaning no further requests are
-      waiting to be enqueued.
+      waiting to be enqueued, or
+    * `max_wait` milliseconds (default 200) have elapsed since the first
+      pending request was enqueued.
 
-  This provides maximum coalescing under bursts and minimum latency under
-  low load: a single request arriving at an idle producer flushes
-  immediately.
+  The mailbox-empty check provides minimum latency under low load: a single
+  request arriving at an idle producer flushes immediately. The `max_wait`
+  timer caps worst-case latency under slow trickle conditions where requests
+  arrive one at a time, fast enough to keep the mailbox non-empty but too
+  slowly to reach `batch_size`.
 
   ## Error Handling
 
@@ -89,6 +93,9 @@ defmodule Flurry do
 
     * `:batch_size` - maximum number of requests in a single bulk call
       (default `100`).
+    * `:max_wait` - maximum time in milliseconds that the first pending
+      request waits before the producer forces a flush (default `200`).
+      Set to `nil` to disable the timer.
   """
 
   @doc false
