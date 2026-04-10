@@ -76,25 +76,23 @@ defmodule Flurry.Consumer do
   end
 
   @doc """
-  Pure strategy dispatch for a failed batch.
+  Dispatches failure handling for a batch according to the configured strategy.
 
-  Given the configured `:on_error` strategy, the failed batch's `entries`,
-  and the raised exception, returns `{replies, requeues}` where:
+  Returns `{replies, requeues}` where:
 
     * `replies` is a list of `{from, result}` pairs to deliver via
       `GenServer.reply/2`.
     * `requeues` is a list of pre-formed batches (each a list of
-      `{arg, from}` entries) to hand back to the producer as priority
-      items for re-execution.
+      `{arg, from}` entries) to return to the producer as priority items
+      for re-execution.
 
-  Strategies:
+  ## Strategies
 
-    * `:fail_all` — every caller in the failed batch gets `{:error, e}`.
-      No requeue.
-    * `:bisect` — if the batch has more than one entry, split in half and
-      requeue both; no replies yet. If the batch is a singleton, the
-      failure is definitively isolated to that one caller — reply error
-      to them alone.
+    * `:fail_all` - replies `{:error, e}` to every caller in the batch.
+      No requeue is performed.
+    * `:bisect` - splits the batch in half and requeues both halves when the
+      batch contains more than one entry. For singleton batches, replies
+      with the error to the sole caller.
   """
   @spec handle_failure(:fail_all | :bisect, [{term, GenServer.from()}], Exception.t()) ::
           {[{GenServer.from(), term}], [[{term, GenServer.from()}]]}
@@ -114,12 +112,13 @@ defmodule Flurry.Consumer do
   end
 
   @doc """
-  Builds the correlation map for a batch result set.
+  Builds a correlation map from a batch result set.
 
-  * `:one` mode → `%{key_value => record}`. Raises `AmbiguousBatchError` if
-    two records share the same key value.
-  * `:list` mode → `%{key_value => [record, ...]}` grouping all records with
-    the same key value.
+  In `:one` mode, returns `%{key_value => record}`. Raises
+  `Flurry.AmbiguousBatchError` if two records share the same key value.
+
+  In `:list` mode, returns `%{key_value => [record, ...]}`, grouping all
+  records with the same key value.
 
   ## Examples
 
@@ -172,7 +171,10 @@ defmodule Flurry.Consumer do
   end
 
   @doc """
-  Extracts one caller's result from the correlation map.
+  Extracts a single caller's result from the correlation map.
+
+  Returns `nil` in `:one` mode or `[]` in `:list` mode when the key is not
+  present.
 
   ## Examples
 

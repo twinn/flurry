@@ -1,10 +1,12 @@
 defmodule Flurry.Decorators do
   @moduledoc """
-  Defines the `@decorate batch(...)` decorator used by modules that
-  `use Flurry`. You don't normally interact with this module directly —
-  `use Flurry` brings the decorator into scope.
+  Provides the `@decorate batch(...)` decorator used by modules that
+  `use Flurry`.
 
-  ## Shapes
+  This module is not intended to be used directly. `use Flurry` brings the
+  decorator into scope automatically.
+
+  ## Decorator Syntax
 
       @decorate batch(get(id))
       def get_many(ids), do: ...
@@ -12,10 +14,10 @@ defmodule Flurry.Decorators do
       @decorate batch(get_by_group(group), returns: :list)
       def get_many_by_group(groups), do: ...
 
-  The first argument is a fake call expression whose *function name* becomes
-  the generated singular entry-point and whose *single argument name* becomes
-  both the parameter of that entry point and the record field used to
-  correlate bulk results back to individual callers.
+  The argument to `batch/1` is a call expression whose function name becomes
+  the generated singular entry point. The first argument name serves as both
+  the parameter of that entry point and the record field used to correlate
+  bulk results back to individual callers.
   """
 
   use Decorator.Define, batch: 1, batch: 2

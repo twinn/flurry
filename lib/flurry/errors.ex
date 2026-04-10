@@ -1,9 +1,11 @@
 defmodule Flurry.AmbiguousBatchError do
   @moduledoc """
-  Raised when a `:one`-mode batch function returns multiple records sharing
-  the same correlation key. The default mode assumes each caller's argument
-  maps to exactly one record; ambiguity here means the function should
-  probably be declared with `returns: :list`.
+  Raised when a `:one`-mode batch function returns multiple records with the
+  same correlation key.
+
+  The default return mode (`:one`) expects each caller's argument to map to
+  exactly one record. When duplicates are detected, this exception is raised
+  to indicate the function should be declared with `returns: :list`.
   """
 
   defexception [:message]
@@ -11,14 +13,12 @@ end
 
 defmodule Flurry.BulkCallFailed do
   @moduledoc """
-  Wraps an abnormal termination of a bulk function call in a uniform
-  exception type. Used for `:exit` (and any future non-exception failures)
-  so that callers always get a struct they can pattern-match on, instead
-  of an opaque exit reason or a mixed set of shapes.
+  Wraps an abnormal termination of a bulk function call.
 
-  Raised exceptions from the bulk function are *not* wrapped — they pass
-  through as-is, so users can continue to match on `Postgrex.Error`,
-  `Ecto.Query.CastError`, etc.
+  Used for `:exit` failures so that callers receive a uniform struct they
+  can pattern-match on, rather than an opaque exit reason. Raised exceptions
+  from the bulk function are not wrapped; they pass through as-is so that
+  callers can match on their original type (e.g., `Postgrex.Error`).
   """
 
   @type kind :: :exit

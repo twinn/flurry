@@ -5,15 +5,15 @@ defmodule Flurry.Runtime do
   # `use Flurry` macro and the functions it generates on the user's module.
 
   @doc """
-  Called by the generated singular entry-point functions. Enqueues a single
-  request into the producer for `{module, singular}` and blocks on the reply.
+  Enqueues a single request into the producer for `{module, singular}` and
+  blocks until the reply is received.
 
   `group_key` is a tuple of the non-batched arguments (empty `{}` for
-  single-arg decorations). Callers sharing the same group key get coalesced
+  single-arg decorations). Callers sharing the same group key are coalesced
   into the same batch; distinct groups run as independent batches.
 
-  `timeout` is the underlying `GenServer.call/3` timeout — i.e. how long
-  the caller will block waiting for the batched result.
+  `timeout` is the `GenServer.call/3` timeout controlling how long the
+  caller blocks waiting for the batched result.
   """
   @spec call(module(), atom(), term(), tuple(), timeout()) :: term()
   def call(module, singular, arg, group_key, timeout) when is_tuple(group_key) do
@@ -21,23 +21,24 @@ defmodule Flurry.Runtime do
     GenServer.call(producer, {:enqueue, group_key, arg}, timeout)
   end
 
-  @doc "Canonical producer name for a given user module + singular function."
+  @doc "Returns the canonical producer name for the given module and singular function."
   @spec producer_name(module(), atom()) :: atom()
   def producer_name(module, singular) do
     Module.concat([module, camelize(singular), "Producer"])
   end
 
-  @doc "Canonical consumer name for a given user module + singular function."
+  @doc "Returns the canonical consumer name for the given module and singular function."
   @spec consumer_name(module(), atom()) :: atom()
   def consumer_name(module, singular) do
     Module.concat([module, camelize(singular), "Consumer"])
   end
 
   @doc """
-  Called by the `:warn`-mode generated entry points. If the given repo
-  has a connection checked out (i.e. the caller is inside a transaction
-  or an explicit `Repo.checkout/2` block), emit a warning pointing at
-  the `:in_transaction` escape hatches.
+  Emits a warning when the caller is inside a transaction.
+
+  Invoked by `:warn`-mode generated entry points. When `repo.checked_out?/0`
+  returns `true`, logs a warning describing the implications and the
+  available `:in_transaction` options.
   """
   @spec maybe_warn_in_transaction(module(), atom(), module()) :: :ok
   def maybe_warn_in_transaction(module, fn_name, repo) do

@@ -96,19 +96,21 @@ defmodule Flurry.Producer do
   end
 
   @doc """
-  Pure decision function for the producer's flush policy. Extracted so the
-  mailbox-peek behavior can be exercised deterministically in unit tests
-  without coordinating real mailbox state.
+  Determines whether the producer should emit a batch event given the
+  current state and mailbox queue length.
+
+  This function is extracted from the GenStage callbacks so that the
+  flush policy can be exercised deterministically in unit tests without
+  coordinating real mailbox state.
 
   Priority batches (pre-formed by the consumer via bisect) take precedence
-  over pending — we drain the entire priority queue one batch at a time
-  before emitting anything from pending. Priority items carry their own
-  group key so they route to the correct group's consumer context.
+  over pending entries. The priority queue is drained one batch at a time
+  before emitting anything from pending.
 
-  Pending emission picks a group by:
+  Pending emission selects a group by:
+
     1. Scanning for any group whose pending count has reached `batch_size`.
-    2. Otherwise, if the mailbox is empty, picking the front (LRU) of
-       `group_order`.
+    2. If the mailbox is empty, selecting the front (LRU) of `group_order`.
     3. Otherwise, holding.
   """
   @spec maybe_emit(map(), non_neg_integer()) :: {list(), map()}
@@ -165,10 +167,12 @@ defmodule Flurry.Producer do
   end
 
   @doc """
-  Splits a group tuple into a routing-key tuple (non-additive values in
-  their original order) and a list of additive values (in the order of
-  `additive_positions`). For non-additive batches (`additive_positions == []`)
-  the routing key equals the input tuple and additive values is `[]`.
+  Splits a group tuple into a routing-key tuple and a list of additive values.
+
+  The routing-key tuple contains non-additive values in their original order.
+  The additive values list follows the order of `additive_positions`. For
+  non-additive batches (`additive_positions == []`), the routing key equals
+  the input tuple and the additive values list is empty.
   """
   @spec split_tuple(tuple(), [non_neg_integer()]) :: {tuple(), [term()]}
   def split_tuple(group_tuple, []), do: {group_tuple, []}
@@ -193,10 +197,11 @@ defmodule Flurry.Producer do
   end
 
   @doc """
-  Merges additive values across a list of entries, position-by-position.
-  Each entry's additive_values is a list of the same length as the
-  caller's `additive_positions`. The default merge is list concatenation
-  followed by `Enum.uniq/1`.
+  Merges additive values across a list of entries, position by position.
+
+  Each entry's additive values list has the same length as `additive_positions`.
+  The default merge concatenates the lists and removes duplicates via
+  `Enum.uniq/1`.
   """
   @spec merge_additive_values([{term(), [term()], GenServer.from()}], non_neg_integer()) ::
           [term()]
@@ -213,8 +218,8 @@ defmodule Flurry.Producer do
   end
 
   @doc """
-  Reconstructs the full group tuple from a routing-key tuple and a list
-  of merged additive values, interleaving them back into the original
+  Reconstructs the full group tuple from a routing-key tuple and a list of
+  merged additive values by interleaving them back into the original
   positions.
   """
   @spec reconstruct_tuple(tuple(), [term()], [non_neg_integer()]) :: tuple()
